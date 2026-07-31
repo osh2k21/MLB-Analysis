@@ -3626,16 +3626,22 @@ def build_constrained_parlay(ml_pool, prop_pool, min_payout, max_payout, max_leg
     # immediately, even though more legs (each a smaller, less extreme price)
     # were available and would have been a more diversified way to hit the
     # same payout target.
-    for size in range(max_legs, 1, -1):
-        # Moneylines almost always outnumber qualifying totals/strikeout/hit
-        # props on a given slate, so a plain random draw across the combined
-        # pool tends to fill every slot with moneylines just by sheer volume.
-        # Explicitly seed roughly half the combo (at least 1) from the
-        # prop/total pool first, when legs are available there, so high-value
-        # parlays actually surface strikeout, hit, and total legs instead of
-        # defaulting to all-moneyline.
-        desired_prop_legs = min(len(prop_pool), max(1, math.ceil(size / 2))) if prop_pool else 0
+    # Group legs by their actual bet type (ml / rl / total / prop) rather
+    # than the coarse ml_pool/prop_pool split. Game totals are almost always
+    # available (one simple market fetch per game) while strikeout/hit/HR
+    # props need an extra per-game API call and can come back empty --
+    # lumping them into one "prop_pool" bucket meant totals crowded out
+    # props by sheer volume, so a round of random draws would seat mostly
+    # totals and moneylines even when good prop legs existed. Bucketing by
+    # real type and round-robin-ing across whichever types actually have
+    # legs available (below) guarantees a parlay pulls from every bet type
+    # present, not just whichever type happens to have the most legs.
+    type_buckets = {}
+    for leg in all_legs:
+        type_buckets.setdefault(leg['type'], []).append(leg)
+    bucket_types = list(type_buckets.keys())
 
+    for size in range(max_legs, 1, -1):
         # Geometric-mean decimal odds needed per leg for `size` legs to land
         # near target_payout. Drawing legs fully at random doesn't account
         # for this: multiplying `size` random odds together compounds fast,
@@ -3650,27 +3656,44 @@ def build_constrained_parlay(ml_pool, prop_pool, min_payout, max_payout, max_leg
         per_leg_target = target_payout ** (1.0 / size)
 
         for _ in range(150):
-            sorted_props = sorted(prop_pool, key=lambda l: abs(l['decimal_odds'] - per_leg_target))
             sorted_all = sorted(all_legs, key=lambda l: abs(l['decimal_odds'] - per_leg_target))
-            shuffled_props = sorted_props[:max(size * 2, 6)]
             shuffled_all = sorted_all[:max(size * 3, 10)]
-            rng.shuffle(shuffled_props)
             rng.shuffle(shuffled_all)
+
+            sorted_buckets = {}
+            for t in bucket_types:
+                s = sorted(type_buckets[t], key=lambda l: abs(l['decimal_odds'] - per_leg_target))
+                top = s[:max(size * 2, 6)]
+                rng.shuffle(top)
+                sorted_buckets[t] = top
 
             combo = []
             used_games = set()
 
-            for leg in shuffled_props:
-                if len(combo) >= desired_prop_legs:
-                    break
-                if leg['game'] not in used_games:
-                    combo.append(leg)
-                    used_games.add(leg['game'])
+            # Round-robin: one pass through the bet types (freshly shuffled
+            # order each attempt) grabbing at most one leg per type per
+            # pass, so a 4-leg combo naturally ends up as one of each type
+            # when all four are available, instead of type composition
+            # being left to chance.
+            type_order = list(bucket_types)
+            rng.shuffle(type_order)
+            bucket_idx = {t: 0 for t in type_order}
+            made_progress = True
+            while len(combo) < size and made_progress:
+                made_progress = False
+                for t in type_order:
+                    if len(combo) >= size:
+                        break
+                    bucket = sorted_buckets[t]
+                    while bucket_idx[t] < len(bucket):
+                        leg = bucket[bucket_idx[t]]
+                        bucket_idx[t] += 1
+                        if leg['game'] not in used_games:
+                            combo.append(leg)
+                            used_games.add(leg['game'])
+                            made_progress = True
+                            break
 
-            for leg in shuffled_all:
-                if leg['game'] not in used_games and len(combo) < size:
-                    combo.append(leg)
-                    used_games.add(leg['game'])
 
             if len(combo) < size:
                 # Widen back out to the FULL pool (not just the odds-band
