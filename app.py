@@ -136,6 +136,50 @@ st.set_page_config(
     layout="wide"
 )
 
+# -----------------------------------------------------------------------------
+# SIMPLE PASSWORD GATE
+# -----------------------------------------------------------------------------
+# Extra layer on top of a private GitHub repo / private Streamlit Cloud app --
+# this makes sure that even if the repo or app visibility ever gets changed
+# (a collaborator added, a setting flipped), nobody can actually USE the app
+# -- and burn your Odds API quota -- without this password.
+# Set APP_PASSWORD in .streamlit/secrets.toml locally, or in the app's
+# Settings -> Secrets box on Streamlit Community Cloud. Never commit the
+# actual password to the repo.
+def _check_password():
+    def _password_entered():
+        correct = st.secrets.get("APP_PASSWORD", None)
+        if correct is None:
+            # No password configured anywhere -- fail safe by treating the
+            # app as locked rather than silently wide open.
+            st.session_state["password_ok"] = False
+            return
+        if st.session_state.get("_password_input", "") == correct:
+            st.session_state["password_ok"] = True
+            del st.session_state["_password_input"]
+        else:
+            st.session_state["password_ok"] = False
+
+    if st.session_state.get("password_ok"):
+        return True
+
+    st.markdown("<h2 style='text-align:center;'>🔒 Locked</h2>", unsafe_allow_html=True)
+    st.text_input(
+        "Password", type="password", key="_password_input", on_change=_password_entered
+    )
+    if "password_ok" in st.session_state and not st.session_state["password_ok"]:
+        st.error("Incorrect password.")
+    if "APP_PASSWORD" not in st.secrets:
+        st.warning(
+            "⚠️ No APP_PASSWORD is set in secrets yet -- add one in "
+            "`.streamlit/secrets.toml` (local) or Settings → Secrets "
+            "(Streamlit Community Cloud) to actually lock this app."
+        )
+    return False
+
+if not _check_password():
+    st.stop()
+
 st.markdown("""
 <style>
     /* Global Dark Navy Theme */
@@ -1817,6 +1861,81 @@ def build_model_hit_prop_projection(hitter_name, team_name, hitter_ba, game_labe
 TRACK_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mlb_track_record.db")
 TRACK_RETENTION_DAYS = 120
 
+# -----------------------------------------------------------------------------
+# TRACK-RECORD DB PERSISTENCE ACROSS RESTARTS (GitHub-backed backup/restore)
+# -----------------------------------------------------------------------------
+# Streamlit Community Cloud's filesystem is ephemeral -- mlb_track_record.db
+# would otherwise reset to empty every time the app redeploys or wakes up
+# from sleep. Rather than rewriting the whole tracking layer onto a hosted
+# database (a large, risky change touching dozens of call sites below), this
+# stores the SQLite file itself as a single file in your private GitHub repo
+# and syncs it down/up around it -- every query below is completely
+# unchanged. Configure two secrets to turn this on:
+#   GITHUB_TOKEN       -- a GitHub Personal Access Token with 'repo' scope
+#   GITHUB_TRACK_REPO  -- "yourusername/your-repo-name" (the same repo you
+#                         deployed the app from works fine)
+# If either is missing, this silently no-ops and the app behaves exactly as
+# before (local-only, resets on restart) -- never a hard failure.
+import base64
+
+def _github_track_config():
+    try:
+        token = st.secrets.get("GITHUB_TOKEN")
+        repo = st.secrets.get("GITHUB_TRACK_REPO")
+    except Exception:
+        return None, None
+    if not token or not repo:
+        return None, None
+    return token, repo
+
+def _github_track_url(repo):
+    return f"https://api.github.com/repos/{repo}/contents/mlb_track_record.db"
+
+def restore_track_db_from_github():
+    """Pulls the persisted DB down from GitHub before anything opens a local
+    connection. Guarded by 'file already exists' so on a warm rerun (the
+    normal case -- Streamlit reruns the whole script on every interaction)
+    this is a no-op; it only does real work once, right after a fresh
+    container start."""
+    if os.path.exists(TRACK_DB_PATH):
+        return
+    token, repo = _github_track_config()
+    if not token:
+        return
+    try:
+        resp = requests.get(
+            _github_track_url(repo),
+            headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            with open(TRACK_DB_PATH, "wb") as f:
+                f.write(base64.b64decode(resp.json()["content"]))
+    except Exception:
+        pass  # any failure here just means we start with a fresh local DB
+
+def backup_track_db_to_github():
+    """Pushes the current local DB back up to GitHub. Only ever called from
+    inside the already-throttled (once-per-30-min) maintenance pass below --
+    never on every rerun -- to stay well within GitHub's API rate limits."""
+    token, repo = _github_track_config()
+    if not token or not os.path.exists(TRACK_DB_PATH):
+        return
+    try:
+        headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+        get_resp = requests.get(_github_track_url(repo), headers=headers, timeout=15)
+        sha = get_resp.json().get("sha") if get_resp.status_code == 200 else None
+        with open(TRACK_DB_PATH, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode()
+        payload = {"message": "Update MLB track-record DB", "content": content_b64}
+        if sha:
+            payload["sha"] = sha
+        requests.put(_github_track_url(repo), headers=headers, json=payload, timeout=30)
+    except Exception:
+        pass  # a missed backup just means the next restart loses this cycle
+
+restore_track_db_from_github()
+
 def get_track_db():
     """One connection per Streamlit session is plenty for a local sqlite file;
     check_same_thread=False since Streamlit can touch it from the fragment
@@ -2411,6 +2530,7 @@ def run_track_record_maintenance():
     except sqlite3.OperationalError:
         return
     st.session_state['track_record_last_run'] = now
+    backup_track_db_to_github()
 
 
 st.markdown("<h1 class='main-title'>⚾ Advanced MLB Algorithmic Analytics Engine</h1>", unsafe_allow_html=True)
@@ -3485,6 +3605,22 @@ def build_constrained_parlay(ml_pool, prop_pool, min_payout, max_payout, max_leg
     candidates = []
     target_payout = (min_payout + max_payout) / 2.0
 
+    def prob_floor_for_size(n):
+        # min_combined_prob was being used as one FLAT floor for every leg
+        # count -- e.g. 0.30 for a 2-leg combo AND for a 6-leg combo. That's
+        # not just strict, it's arithmetically almost impossible past 2 legs:
+        # multiplying together several legs that are each individually near
+        # their own minimum bar (58% for moneylines, 73% for props) sinks
+        # below a flat 0.30 by 3 legs and keeps falling from there, so every
+        # High-Value parlay search was structurally forced down to 2 legs no
+        # matter how many were requested. Anchoring the floor at 2 legs (so
+        # behavior at size=2 is unchanged) and scaling it geometrically for
+        # larger sizes keeps the same *average per-leg* quality bar instead
+        # of an ever-harder-to-clear absolute product.
+        if min_combined_prob is None:
+            return None
+        return min_combined_prob ** (n / 2.0)
+
     # Try the largest leg counts first. Searching small-to-large meant that as
     # soon as any 2-leg combo landed in the payout range it was returned
     # immediately, even though more legs (each a smaller, less extreme price)
@@ -3500,10 +3636,25 @@ def build_constrained_parlay(ml_pool, prop_pool, min_payout, max_payout, max_leg
         # defaulting to all-moneyline.
         desired_prop_legs = min(len(prop_pool), max(1, math.ceil(size / 2))) if prop_pool else 0
 
+        # Geometric-mean decimal odds needed per leg for `size` legs to land
+        # near target_payout. Drawing legs fully at random doesn't account
+        # for this: multiplying `size` random odds together compounds fast,
+        # so as size grows the random product almost always blows straight
+        # past max_payout before landing in the window -- 2-leg combos were
+        # the only size where a random draw reliably fit the narrow range,
+        # which is why every high-value parlay was collapsing to 2 legs
+        # regardless of max_legs. Biasing each pool toward legs whose own
+        # odds sit near this per-leg target (while still shuffling within
+        # that band for variety) makes the compounded payout actually land
+        # near the target as size increases.
+        per_leg_target = target_payout ** (1.0 / size)
+
         for _ in range(150):
-            shuffled_props = list(prop_pool)
+            sorted_props = sorted(prop_pool, key=lambda l: abs(l['decimal_odds'] - per_leg_target))
+            sorted_all = sorted(all_legs, key=lambda l: abs(l['decimal_odds'] - per_leg_target))
+            shuffled_props = sorted_props[:max(size * 2, 6)]
+            shuffled_all = sorted_all[:max(size * 3, 10)]
             rng.shuffle(shuffled_props)
-            shuffled_all = list(all_legs)
             rng.shuffle(shuffled_all)
 
             combo = []
@@ -3522,7 +3673,12 @@ def build_constrained_parlay(ml_pool, prop_pool, min_payout, max_payout, max_leg
                     used_games.add(leg['game'])
 
             if len(combo) < size:
-                for leg in shuffled_all:
+                # Widen back out to the FULL pool (not just the odds-band
+                # slice) so a short slate can still reach `size` legs by
+                # reusing games if it truly has to -- same fallback as
+                # before, just now only triggered when the biased slice
+                # genuinely doesn't have enough distinct games.
+                for leg in sorted_all:
                     if leg not in combo and len(combo) < size:
                         combo.append(leg)
 
@@ -3533,17 +3689,19 @@ def build_constrained_parlay(ml_pool, prop_pool, min_payout, max_payout, max_leg
                     payout *= l['decimal_odds']
                     combined_prob *= l['model_prob']
                 meets_payout = min_payout <= payout <= max_payout
-                meets_prob = (min_combined_prob is None) or (combined_prob >= min_combined_prob)
+                size_floor = prob_floor_for_size(len(combo))
+                meets_prob = (size_floor is None) or (combined_prob >= size_floor)
                 if meets_payout and meets_prob:
                     return combo
                 candidates.append((abs(payout - target_payout), combo, combined_prob))
 
     if candidates:
         # If there's a combined-probability floor, only consider candidates
-        # that actually clear it (falling back to the full candidate list
-        # only if literally nothing does, so we still return something).
+        # that actually clear it FOR THEIR OWN leg count (falling back to the
+        # full candidate list only if literally nothing does, so we still
+        # return something).
         if min_combined_prob is not None:
-            prob_ok = [c for c in candidates if c[2] >= min_combined_prob]
+            prob_ok = [c for c in candidates if c[2] >= prob_floor_for_size(len(c[1]))]
             pool_source = prob_ok if prob_ok else candidates
         else:
             pool_source = candidates
