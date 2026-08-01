@@ -2639,6 +2639,43 @@ def get_saved_odds_api_key():
 
 saved_odds_api_key = get_saved_odds_api_key()
 
+st.sidebar.markdown("---")
+enable_odds_api = st.sidebar.toggle(
+    "🔌 Enable Odds API (Live Market Data)",
+    value=True,
+    help="Turn OFF to stop every Odds API call app-wide instantly -- bulk moneyline/run "
+         "line/total odds, player props, and Kalshi alternate-spread ladders all stop "
+         "hitting the API. Useful when you're close to your monthly call limit. While "
+         "off, you'll still see the model's own win-probability predictions -- just no "
+         "live market odds or edge comparison, since there's no market data to compare against."
+)
+
+# Clear the Odds-API-specific caches the instant this switch flips (either
+# direction), so turning it back ON always makes one genuinely fresh call
+# right now rather than possibly serving a result cached from before the
+# flip (fetch_bulk_market_odds/etc. cache for 10 minutes -- without this,
+# switching on partway through that window would silently reuse the old
+# cached data instead of actually calling the API). This does NOT touch
+# unrelated caches (schedule, standings, pitcher stats, etc.) -- only the
+# three functions that actually hit The Odds API.
+if 'prev_enable_odds_api' not in st.session_state:
+    st.session_state['prev_enable_odds_api'] = enable_odds_api
+if st.session_state['prev_enable_odds_api'] != enable_odds_api:
+    fetch_bulk_market_odds.clear()
+    fetch_event_player_props.clear()
+    fetch_event_alternate_spreads.clear()
+    st.session_state['prev_enable_odds_api'] = enable_odds_api
+
+if enable_odds_api:
+    if st.sidebar.button("🔄 Refresh Odds Now", help="Clears the Odds API cache and makes a fresh call immediately, instead of waiting for the normal 10-minute cache to expire on its own."):
+        fetch_bulk_market_odds.clear()
+        fetch_event_player_props.clear()
+        fetch_event_alternate_spreads.clear()
+        st.rerun()
+
+if not enable_odds_api:
+    st.sidebar.warning("🔌 Odds API calls are OFF. No API credits are being used right now.")
+
 if saved_odds_api_key:
     odds_api_key = saved_odds_api_key
     st.sidebar.success("✅ Odds API key loaded automatically (from secrets.toml / environment).")
@@ -2647,6 +2684,13 @@ else:
         "The-Odds-API Key", type="password",
         help="Required to show any bets. Without a key, this app will not invent odds -- it will only show model win-probabilities for context. Tip: save it in .streamlit/secrets.toml so you don't need to re-enter it each session."
     )
+
+# Every fetch_bulk_market_odds / fetch_event_*_odds call site already treats
+# an empty api_key as "skip the call, return {} / no_key status" -- so
+# routing an empty string through here when the switch is off is a single
+# clean kill-switch for the ENTIRE Odds API surface, without needing to
+# thread an extra flag through every call site individually.
+effective_odds_api_key = odds_api_key if enable_odds_api else ""
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🗓️ Model & Scope Controls")
@@ -2689,9 +2733,15 @@ if include_props:
     )
 
 games = fetch_mlb_schedule(date_str)
-market_map, market_odds_diagnostic = fetch_bulk_market_odds(odds_api_key, chosen_bm_key, strict=strict_kalshi)
+market_map, market_odds_diagnostic = fetch_bulk_market_odds(effective_odds_api_key, chosen_bm_key, strict=strict_kalshi)
 
-if market_odds_diagnostic['status'] not in ('ok',):
+if not enable_odds_api:
+    st.info(
+        "🔌 **Odds API is turned off** (sidebar toggle). Showing the model's own win-probability "
+        "predictions only -- no live market odds, edge comparison, or parlay builder until it's "
+        "switched back on."
+    )
+elif market_odds_diagnostic['status'] not in ('ok',):
     _diag_status = market_odds_diagnostic['status']
     _diag_detail = market_odds_diagnostic['detail']
     if _diag_status == 'http_error' and market_odds_diagnostic.get('status_code') in (401, 403):
@@ -2722,7 +2772,7 @@ if not odds_api_key:
         "for informational context. Add a free key from the-odds-api.com in the sidebar to unlock real "
         "lines, market probabilities, and the parlay builder."
     )
-elif not market_map:
+elif not market_map and enable_odds_api:
     st.warning(
         "⚠️ Live odds could not be retrieved right now (API limit, no games currently priced by any "
         "tracked book, or a network issue). Recommendations below will only include games where a real "
@@ -3255,7 +3305,7 @@ st.caption(
 
 event_props = {}
 if include_props and selected_game_item.get('market_entry') and selected_game_item['market_entry'].get('event_id'):
-    event_props = fetch_event_player_props(odds_api_key, selected_game_item['market_entry']['event_id'], chosen_bm_key)
+    event_props = fetch_event_player_props(effective_odds_api_key, selected_game_item['market_entry']['event_id'], chosen_bm_key)
 
 cand_bets = []
 
@@ -3584,9 +3634,9 @@ if _event_ids_needing_props or _event_ids_needing_alt_spreads:
         with ThreadPoolExecutor(max_workers=_prop_worker_count) as _executor:
             _futures = []
             for _eid in _event_ids_needing_props:
-                _futures.append(_executor.submit(_safe_call, fetch_event_player_props, odds_api_key, _eid, chosen_bm_key, strict_kalshi))
+                _futures.append(_executor.submit(_safe_call, fetch_event_player_props, effective_odds_api_key, _eid, chosen_bm_key, strict_kalshi))
             for _eid in _event_ids_needing_alt_spreads:
-                _futures.append(_executor.submit(_safe_call, fetch_event_alternate_spreads, odds_api_key, _eid, chosen_bm_key, True))
+                _futures.append(_executor.submit(_safe_call, fetch_event_alternate_spreads, effective_odds_api_key, _eid, chosen_bm_key, True))
             for _f in as_completed(_futures):
                 pass  # results discarded -- this call's only job is to populate the shared cache
 
@@ -3628,7 +3678,7 @@ for r in ml_results_sorted:
         # books, matching the same strict sourcing used for props below.
         if r.get('market_entry') and r['market_entry'].get('event_id'):
             alt_spreads = fetch_event_alternate_spreads(
-                odds_api_key, r['market_entry']['event_id'], chosen_bm_key, strict=True
+                effective_odds_api_key, r['market_entry']['event_id'], chosen_bm_key, strict=True
             )
             for leg in build_alt_spread_legs(r, r['away_exp_runs'], r['home_exp_runs'], alt_spreads, r['game']):
                 if leg['model_prob'] >= 0.73:
@@ -3659,7 +3709,7 @@ for r in ml_results_sorted:
     if include_props_in_parlay and r.get('market_entry') and r['market_entry'].get('event_id'):
         props_diag['eligible_games'] += 1
         ev_props = fetch_event_player_props(
-            odds_api_key, r['market_entry']['event_id'], chosen_bm_key, strict=strict_kalshi
+            effective_odds_api_key, r['market_entry']['event_id'], chosen_bm_key, strict=strict_kalshi
         )
         if ev_props:
             props_diag['games_with_props_data'] += 1
