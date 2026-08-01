@@ -2987,7 +2987,15 @@ st.markdown("---")
 # -----------------------------------------------------------------------------
 # SECTION 4: FULL SLATE TABLE
 # -----------------------------------------------------------------------------
-st.markdown(f"### 🏆 Full Slate Predictions & Starting Pitchers ({selected_bookmaker}) — Total Games: {len(games)}")
+# Finished games already have their own dedicated table above (Section 2:
+# "Final / Ended Games Scores"), so they're excluded here to avoid showing
+# the same game twice -- this table is meant for what's still upcoming or
+# actively in progress.
+non_final_results = [r for r in ml_results_sorted if r['abstract_state'] != 'Final']
+st.markdown(
+    f"### 🏆 Full Slate Predictions & Starting Pitchers ({selected_bookmaker}) — "
+    f"{len(non_final_results)} of {len(games)} Games (Upcoming/Live)"
+)
 
 def short_name(full_name):
     """Short form of a team/pitcher name (e.g. 'Los Angeles Dodgers' -> 'Dodgers',
@@ -2997,7 +3005,7 @@ def short_name(full_name):
 
 ml_table_data = []
 ml_table_data_full = []
-for idx, r in enumerate(ml_results_sorted, 1):
+for idx, r in enumerate(non_final_results, 1):
     if not r['is_ready']:
         status_tag = "🛑 Withheld"
         status_tag_full = f"🛑 WITHHELD ({r['warning_reason']})"
@@ -3463,6 +3471,13 @@ master_legs = []
 track_conn = get_track_db()
 for r in ml_results_sorted:
     if not r['is_ready']:
+        continue
+    if r['abstract_state'] == 'Final':
+        # Can't place a new bet on a game that's already over -- exclude it
+        # from the parlay-leg pool entirely rather than relying on is_ready,
+        # which is deliberately True for Final games (it only gates on
+        # pitcher-announcement, since obviously the starters are known by
+        # the time a game has ended).
         continue
 
     if r['has_ml_market'] and r['model_prob'] >= 0.58:
