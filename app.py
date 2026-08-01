@@ -401,6 +401,14 @@ st.markdown("""
         font-weight: 700;
         color: #94A3B8 !important;
     }
+    .scorechip-pitcher-dot {
+        display: inline-block;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        margin-right: 4px;
+        vertical-align: middle;
+    }
     .scorechip-pitcher-k-sep {
         color: #334155 !important;
     }
@@ -2843,25 +2851,29 @@ except sqlite3.OperationalError:
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=10)
 def fetch_live_pitcher_strikeouts(game_pk, away_pitcher_id, home_pitcher_id):
-    """Live in-game strikeout count for each STARTING pitcher, straight from
-    MLB's free boxscore endpoint (no API key/credit involved -- separate
-    from the rate-limited Odds API entirely). Cached at the same 10s
-    interval as the live ticker itself, so this doesn't add extra calls
-    beyond what the ticker already does.
+    """Live in-game strikeout count AND still-pitching status for each
+    STARTING pitcher, straight from MLB's free boxscore endpoint (no API
+    key/credit involved -- separate from the rate-limited Odds API
+    entirely). Cached at the same 10s interval as the live ticker itself,
+    so this doesn't add extra calls beyond what the ticker already does.
 
-    Returns (away_k, home_k) -- either can be None if that pitcher doesn't
-    have a stat line yet (game just started) or has already been pulled
-    from the game (in which case this is his final strikeout total for the
-    outing, which is exactly the right thing to show -- it just stops
-    climbing once he's out of the game)."""
+    Returns (away_k, home_k, away_still_pitching, home_still_pitching).
+    K counts can be None if that pitcher doesn't have a stat line yet (game
+    just started) or has already been pulled (in which case it's his final
+    strikeout total for the outing -- correct, since it just stops climbing
+    once he's out). still_pitching is None if it can't be determined, else
+    True/False based on whether he's the last name in that team's pitching
+    order so far (MLB's boxscore lists pitchers in the order they
+    appeared -- the last one in that list is whoever's actually on the
+    mound right now)."""
     if not game_pk:
-        return None, None
+        return None, None, None, None
     try:
         url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
         resp = requests.get(url, timeout=8)
         data = resp.json()
     except Exception:
-        return None, None
+        return None, None, None, None
 
     def _find_k(team_key, pitcher_id):
         if not pitcher_id:
@@ -2872,9 +2884,22 @@ def fetch_live_pitcher_strikeouts(game_pk, away_pitcher_id, home_pitcher_id):
             return None
         return entry.get('stats', {}).get('pitching', {}).get('strikeOuts')
 
-    return _find_k('away', away_pitcher_id), _find_k('home', home_pitcher_id)
+    def _still_pitching(team_key, pitcher_id):
+        if not pitcher_id:
+            return None
+        pitchers_list = data.get('teams', {}).get(team_key, {}).get('pitchers', [])
+        if not pitchers_list:
+            return None
+        return pitchers_list[-1] == pitcher_id
 
-def render_scorechip_html(r, away_k=None, home_k=None):
+    return (
+        _find_k('away', away_pitcher_id),
+        _find_k('home', home_pitcher_id),
+        _still_pitching('away', away_pitcher_id),
+        _still_pitching('home', home_pitcher_id),
+    )
+
+def render_scorechip_html(r, away_k=None, home_k=None, away_still_pitching=None, home_still_pitching=None):
     """Builds one broadcast-style live-game scoreboard card: a title header,
     a LIVE + inning status row, glove-flanked score columns with the live
     base-runner diamond as the center icon, and B/S/O dot rows -- all real,
@@ -2936,11 +2961,21 @@ def render_scorechip_html(r, away_k=None, home_k=None):
     home_k_display = f"{home_k} K" if home_k is not None else "—"
     away_sp_last = pitcher_last_name(r["away_pitcher"])
     home_sp_last = pitcher_last_name(r["home_pitcher"])
+
+    def _status_dot(still_pitching):
+        if still_pitching is None:
+            return ''
+        color = '#10B981' if still_pitching else '#64748B'  # green = still in, gray = pulled
+        label = 'Still pitching' if still_pitching else 'Pulled from game'
+        return f'<span class="scorechip-pitcher-dot" style="background:{color};" title="{label}"></span>'
+
+    away_dot = _status_dot(away_still_pitching)
+    home_dot = _status_dot(home_still_pitching)
     pitcher_k_row = (
         f'<div class="scorechip-pitcher-k-row">'
-        f'<span title="{r["away_pitcher"]}">{away_sp_last}: {away_k_display}</span>'
+        f'<span title="{r["away_pitcher"]}">{away_dot}{away_sp_last}: {away_k_display}</span>'
         f'<span class="scorechip-pitcher-k-sep">|</span>'
-        f'<span title="{r["home_pitcher"]}">{home_sp_last}: {home_k_display}</span>'
+        f'<span title="{r["home_pitcher"]}">{home_dot}{home_sp_last}: {home_k_display}</span>'
         f'</div>'
     )
 
