@@ -2044,6 +2044,58 @@ def log_ml_prediction(conn, r):
     except sqlite3.OperationalError:
         pass
 
+def apply_locked_ml_prediction(conn, r, min_edge, min_prob):
+    """Freezes the model's moneyline pick/probability at whatever it was the
+    FIRST time this game was ever logged today (log_ml_prediction is a
+    no-op after that first insert, since it's INSERT OR IGNORE keyed on
+    game_pk). Without this, once a game goes live, the starting pitcher's
+    season ERA/WHIP/K9 -- which the MLB Stats API updates in real time as
+    HE pitches THIS very game -- keeps feeding back into 'the prediction'
+    for that same game, so the number drifts as a reaction to the game
+    already in progress rather than staying a stable pre-game forecast.
+    Market data (implied_prob/market_odds_str/edge) is intentionally left
+    live -- a real sportsbook/Kalshi price moving is useful information;
+    the model's own forecast drifting because of the outcome it's supposed
+    to be predicting is not."""
+    if not r.get('game_pk'):
+        return r
+    pred_key = f"{r['game_pk']}:ml_full"
+    try:
+        row = conn.execute(
+            "SELECT pick, model_prob FROM ml_predictions WHERE pred_key = ?", (pred_key,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return r
+    if not row:
+        return r
+    locked_pick, locked_model_prob = row
+
+    r['pick'] = locked_pick
+    r['model_prob'] = locked_model_prob
+    r['underdog'] = r['home_team'] if locked_pick == r['away_team'] else r['away_team']
+    r['fair_odds'] = prob_to_american(locked_model_prob)
+    r['fair_multiplier'] = prob_to_multiplier(locked_model_prob)
+
+    # Re-derive market odds/implied prob for whichever side is now the
+    # LOCKED pick (not whatever side happened to be the freshly-computed
+    # pick this rerun) -- on the rare day the model's side actually flips
+    # intraday, this keeps the displayed market price matched to the real
+    # locked pick instead of silently showing the other team's odds.
+    market_entry = r.get('market_entry')
+    if r.get('has_ml_market') and market_entry and market_entry.get('h2h'):
+        h2h = market_entry['h2h']
+        market_odds = h2h['home_odds'] if locked_pick == r['home_team'] else h2h['away_odds']
+        implied_prob = american_to_prob(market_odds)
+        r['market_odds'] = market_odds
+        r['market_odds_str'] = fmt_american(market_odds)
+        r['implied_prob'] = implied_prob
+        r['edge'] = (locked_model_prob - implied_prob) * 100.0
+        r['is_qualified'] = r['is_ready'] and (r['edge'] >= min_edge) and (locked_model_prob >= max(min_prob, 0.58))
+    else:
+        r['edge'] = None
+        r['is_qualified'] = False
+    return r
+
 def log_pitcher_start(conn, game_pk, game_date, pitcher_name, team, opponent, season_k_avg):
     """Logs ONE starting pitcher's pre-game strikeout projection, regardless
     of whether any prop bet exists on them -- this is what makes it possible
@@ -2695,19 +2747,30 @@ with st.spinner(f"Loading real-time stats for {len(games)} game(s) on {date_str}
 
     ml_results = [model_moneyline_game(g, market_map, min_edge_threshold, min_win_prob_threshold, strict_lineup_mode, season, standings_map, ops_leaders_map) for g in games]
 
+# Lock in each game's moneyline pick/probability at its first-ever-logged
+# value (see apply_locked_ml_prediction) before anything below -- sorting,
+# qualifying, parlay-pool building -- reads model_prob/edge/is_qualified.
+_pred_conn = get_track_db()
+for r in ml_results:
+    if r['is_ready'] and r.get('game_pk'):
+        _ = log_ml_prediction(_pred_conn, r)
+        apply_locked_ml_prediction(_pred_conn, r, min_edge_threshold, min_win_prob_threshold)
+try:
+    _pred_conn.commit()
+except sqlite3.OperationalError:
+    pass
+
 ml_results_sorted = sorted(ml_results, key=lambda x: (x['edge'] if x['edge'] is not None else -999), reverse=True)
 qualified_picks = [r for r in ml_results_sorted if r['is_qualified']]
 final_games = [r for r in ml_results_sorted if r['abstract_state'] == 'Final']
 
-# Log every moneyline pick and every announced starting pitcher for the WHOLE
-# slate, unconditionally -- no confidence threshold, no parlay-pool
-# filtering. This is the complete, unbiased dataset for actually checking
-# whether the model's win-probabilities and K-projections are trustworthy.
-_pred_conn = get_track_db()
+# Log every announced starting pitcher for the WHOLE slate, unconditionally
+# -- no confidence threshold, no parlay-pool filtering. This is the
+# complete, unbiased dataset for checking whether the K/9-based projection
+# runs hot or cold. (Moneyline picks are already logged/locked above.)
 for r in ml_results_sorted:
     if not r['is_ready'] or not r.get('game_pk'):
         continue
-    _ = log_ml_prediction(_pred_conn, r)
     if "TBD" not in r['away_pitcher']:
         _ = log_pitcher_start(_pred_conn, r['game_pk'], r['game_date'], r['away_pitcher'], r['away_team'], r['home_team'], r['away_stats']['k_avg'])
     if "TBD" not in r['home_pitcher']:
@@ -2823,6 +2886,19 @@ def render_live_scores_section(current_date, current_market_map, min_edge, min_p
 
     current_games = fetch_mlb_schedule(current_date)
     current_ml_results = [model_moneyline_game(g, current_market_map, min_edge, min_prob, strict_mode, current_season, current_standings_map, current_ops_leaders_map) for g in current_games]
+    # Same lock as the main slate list -- without it, this ticker (which
+    # reruns every 15 seconds on its own, no click needed) is exactly where
+    # a live-drifting pick/probability would be most visible, since the
+    # pitcher currently on the mound updates his own season stats mid-game.
+    _live_conn = get_track_db()
+    for r in current_ml_results:
+        if r['is_ready'] and r.get('game_pk'):
+            _ = log_ml_prediction(_live_conn, r)
+            apply_locked_ml_prediction(_live_conn, r, min_edge, min_prob)
+    try:
+        _live_conn.commit()
+    except sqlite3.OperationalError:
+        pass
     # abstractGameState flips to 'Live' a little early for some games --
     # during warmup / pre-game ceremonies / a delayed start before the first
     # pitch is actually thrown -- which is why a scorechip could show up
