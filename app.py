@@ -136,50 +136,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# -----------------------------------------------------------------------------
-# SIMPLE PASSWORD GATE
-# -----------------------------------------------------------------------------
-# Extra layer on top of a private GitHub repo / private Streamlit Cloud app --
-# this makes sure that even if the repo or app visibility ever gets changed
-# (a collaborator added, a setting flipped), nobody can actually USE the app
-# -- and burn your Odds API quota -- without this password.
-# Set APP_PASSWORD in .streamlit/secrets.toml locally, or in the app's
-# Settings -> Secrets box on Streamlit Community Cloud. Never commit the
-# actual password to the repo.
-def _check_password():
-    def _password_entered():
-        correct = st.secrets.get("APP_PASSWORD", None)
-        if correct is None:
-            # No password configured anywhere -- fail safe by treating the
-            # app as locked rather than silently wide open.
-            st.session_state["password_ok"] = False
-            return
-        if st.session_state.get("_password_input", "") == correct:
-            st.session_state["password_ok"] = True
-            del st.session_state["_password_input"]
-        else:
-            st.session_state["password_ok"] = False
-
-    if st.session_state.get("password_ok"):
-        return True
-
-    st.markdown("<h2 style='text-align:center;'>🔒 Locked</h2>", unsafe_allow_html=True)
-    st.text_input(
-        "Password", type="password", key="_password_input", on_change=_password_entered
-    )
-    if "password_ok" in st.session_state and not st.session_state["password_ok"]:
-        st.error("Incorrect password.")
-    if "APP_PASSWORD" not in st.secrets:
-        st.warning(
-            "⚠️ No APP_PASSWORD is set in secrets yet -- add one in "
-            "`.streamlit/secrets.toml` (local) or Settings → Secrets "
-            "(Streamlit Community Cloud) to actually lock this app."
-        )
-    return False
-
-if not _check_password():
-    st.stop()
-
 st.markdown("""
 <style>
     /* Global Dark Navy Theme */
@@ -2539,7 +2495,7 @@ st.markdown("<div class='sub-title'>Every bet shown is tied to a real, currently
 st.sidebar.markdown("### 🎯 Market Source")
 selected_bookmaker = st.sidebar.selectbox(
     "Preferred Bookmaker / Exchange",
-    options=["DraftKings", "FanDuel", "BetMGM", "Kalshi"],
+    options=["Kalshi", "DraftKings", "FanDuel", "BetMGM"],
     index=0
 )
 bookmaker_key_map = {
@@ -2598,27 +2554,25 @@ strict_lineup_mode = st.sidebar.toggle(
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🎯 Kalshi Compatibility")
-kalshi_mode = st.sidebar.toggle(
-    "Build parlays from Kalshi's actual contract structure",
-    value=True,
-    help="Kalshi doesn't have a traditional -1.5/+1.5 run line -- it lists a ladder of separate "
-         "'team wins by X+ runs' YES/NO contracts (1.5, 2.5, 3.5+, etc.) instead. When on and Kalshi "
-         "is the selected exchange, the old-style run line is dropped and replaced with these real "
-         "margin-threshold contracts, priced from Kalshi specifically (no silent fallback to other books)."
+st.sidebar.caption(
+    "Always on: run lines are built from Kalshi's real 'team wins by X+ runs' "
+    "ladder of contracts (1.5, 2.5, 3.5+, etc.) rather than a traditional "
+    "-1.5/+1.5 line, whenever Kalshi is the selected exchange."
 )
+kalshi_mode = True
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🎲 Player Props (Optional)")
 include_props = st.sidebar.toggle(
     "Show real pitcher K / batter hit / batter HR prop lines for the selected matchup",
-    value=True,
+    value=False,
     help="Uses 1 extra API credit for the game you're viewing in the Deep-Dive tab."
 )
 include_props_in_parlay = False
 if include_props:
     include_props_in_parlay = st.sidebar.checkbox(
         "Also use real prop lines in the parlay builder",
-        value=True,
+        value=False,
         help="Uses 1 extra API credit PER GAME in today's slate -- can add up quickly on a full slate."
     )
 
