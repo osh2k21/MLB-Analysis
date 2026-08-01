@@ -855,7 +855,7 @@ def estimate_expected_runs(pitcher_era, opposing_team_runs_pg, park_factor):
     base = (pitcher_era + opposing_team_runs_pg) / 2.0
     return max(1.5, base * park_factor)
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=10)
 def fetch_mlb_schedule(date_str):
     """Fetch MLB schedule, live scores, lineups, ball-to-ball count, and game status from MLB API."""
     url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date_str}&hydrate=probablePitcher,lineups,weather,team,linescore,status"
@@ -2903,7 +2903,7 @@ def render_scorechip_html(r):
         f'</div>'
     )
 
-@st.fragment(run_every=15)
+@st.fragment(run_every=10)
 def render_live_scores_section(current_date, current_market_map, min_edge, min_prob, strict_mode):
     st.markdown("### 🔴 Live In-Progress Games & Ball-to-Ball Tracking")
 
