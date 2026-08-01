@@ -78,6 +78,18 @@ def team_abbr(full_name):
         return TEAM_ABBREVIATIONS[full_name]
     return full_name.split()[-1][:3].upper()
 
+def pitcher_last_name(full_name):
+    """Last name only, for compact display (e.g. 'Gerrit Cole' -> 'Cole'),
+    skipping generational suffixes so 'Vladimir Guerrero Jr.' -> 'Guerrero'
+    rather than 'Jr.'."""
+    if not full_name or "TBD" in full_name:
+        return "TBD"
+    parts = full_name.replace('.', '').split()
+    suffixes = {"jr", "sr", "ii", "iii", "iv", "v"}
+    while len(parts) > 1 and parts[-1].lower() in suffixes:
+        parts = parts[:-1]
+    return parts[-1] if parts else full_name
+
 # City/region-only display name for the scorechip's title (e.g. "Colorado vs
 # San Diego"). Most teams can just drop the nickname, but 6 teams share a
 # city with another team -- for those, fall back to the nickname instead so
@@ -378,6 +390,19 @@ st.markdown("""
         justify-content: center;
         gap: 18px;
         margin-top: 4px;
+    }
+    .scorechip-pitcher-k-row {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        margin-top: 6px;
+        font-size: 0.72rem;
+        font-weight: 700;
+        color: #94A3B8 !important;
+    }
+    .scorechip-pitcher-k-sep {
+        color: #334155 !important;
     }
     .scorechip-count-group {
         display: flex;
@@ -1424,6 +1449,8 @@ def model_moneyline_game(game, market_map, min_edge, min_prob, strict_lineup_mod
         'away_team_id': game.get('away_team_id'),
         'home_pitcher': game['home_pitcher'],
         'away_pitcher': game['away_pitcher'],
+        'home_pitcher_id': game.get('home_pitcher_id'),
+        'away_pitcher_id': game.get('away_pitcher_id'),
         'home_stats': home_stats,
         'away_stats': away_stats,
         'home_hitter': home_hitter,
@@ -2814,7 +2841,40 @@ except sqlite3.OperationalError:
 # -----------------------------------------------------------------------------
 # SECTION 1: LIVE IN-PROGRESS GAMES & TRACKING
 # -----------------------------------------------------------------------------
-def render_scorechip_html(r):
+@st.cache_data(ttl=10)
+def fetch_live_pitcher_strikeouts(game_pk, away_pitcher_id, home_pitcher_id):
+    """Live in-game strikeout count for each STARTING pitcher, straight from
+    MLB's free boxscore endpoint (no API key/credit involved -- separate
+    from the rate-limited Odds API entirely). Cached at the same 10s
+    interval as the live ticker itself, so this doesn't add extra calls
+    beyond what the ticker already does.
+
+    Returns (away_k, home_k) -- either can be None if that pitcher doesn't
+    have a stat line yet (game just started) or has already been pulled
+    from the game (in which case this is his final strikeout total for the
+    outing, which is exactly the right thing to show -- it just stops
+    climbing once he's out of the game)."""
+    if not game_pk:
+        return None, None
+    try:
+        url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
+        resp = requests.get(url, timeout=8)
+        data = resp.json()
+    except Exception:
+        return None, None
+
+    def _find_k(team_key, pitcher_id):
+        if not pitcher_id:
+            return None
+        players = data.get('teams', {}).get(team_key, {}).get('players', {})
+        entry = players.get(f"ID{pitcher_id}")
+        if not entry:
+            return None
+        return entry.get('stats', {}).get('pitching', {}).get('strikeOuts')
+
+    return _find_k('away', away_pitcher_id), _find_k('home', home_pitcher_id)
+
+def render_scorechip_html(r, away_k=None, home_k=None):
     """Builds one broadcast-style live-game scoreboard card: a title header,
     a LIVE + inning status row, glove-flanked score columns with the live
     base-runner diamond as the center icon, and B/S/O dot rows -- all real,
@@ -2872,6 +2932,18 @@ def render_scorechip_html(r):
         f'</svg>'
     )
 
+    away_k_display = f"{away_k} K" if away_k is not None else "—"
+    home_k_display = f"{home_k} K" if home_k is not None else "—"
+    away_sp_last = pitcher_last_name(r["away_pitcher"])
+    home_sp_last = pitcher_last_name(r["home_pitcher"])
+    pitcher_k_row = (
+        f'<div class="scorechip-pitcher-k-row">'
+        f'<span title="{r["away_pitcher"]}">{away_sp_last}: {away_k_display}</span>'
+        f'<span class="scorechip-pitcher-k-sep">|</span>'
+        f'<span title="{r["home_pitcher"]}">{home_sp_last}: {home_k_display}</span>'
+        f'</div>'
+    )
+
     return (
         f'<div class="scorechip">'
         f'<div class="scorechip-title">{title_label}</div>'
@@ -2899,6 +2971,7 @@ def render_scorechip_html(r):
         f'<div class="scorechip-count-group"><span class="scorechip-label">S</span>{strikes_row}</div>'
         f'<div class="scorechip-count-group"><span class="scorechip-label">O</span>{outs_row}</div>'
         f'</div>'
+        f'{pitcher_k_row}'
         f'<div class="scorechip-pick">👉 {r["pick"]} ({r["model_prob"]*100:.1f}%) | {r["market_odds_str"]}</div>'
         f'</div>'
     )
@@ -2945,7 +3018,13 @@ def render_live_scores_section(current_date, current_market_map, min_edge, min_p
     current_live_games = [r for r in current_ml_results if is_actually_in_progress(r)]
 
     if current_live_games:
-        chips_html = "".join([render_scorechip_html(r) for r in current_live_games])
+        chips_html = "".join([
+            render_scorechip_html(
+                r,
+                *fetch_live_pitcher_strikeouts(r['game_pk'], r.get('away_pitcher_id'), r.get('home_pitcher_id'))
+            )
+            for r in current_live_games
+        ])
         st.markdown(f'<div class="scorechip-grid">{chips_html}</div>', unsafe_allow_html=True)
     else:
         st.info("ℹ️ No games are currently live right now for this date.")
