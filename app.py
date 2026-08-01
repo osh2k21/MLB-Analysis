@@ -924,6 +924,7 @@ def fetch_mlb_schedule(date_str):
                 game_info = {
                     'game_pk': g.get('gamePk'),
                     'game_time_ct': time_ct,
+                    'game_datetime_utc': utc_date,
                     'game_date': g.get('officialDate', date_str),
                     'game_number': game_number,
                     'is_doubleheader': is_doubleheader,
@@ -1416,6 +1417,7 @@ def model_moneyline_game(game, market_map, min_edge, min_prob, strict_lineup_mod
         'game_number': game.get('game_number', 1),
         'is_doubleheader': game.get('is_doubleheader', False),
         'time_ct': game['game_time_ct'],
+        'game_datetime_utc': game.get('game_datetime_utc'),
         'home_team': game['home_team'],
         'away_team': game['away_team'],
         'home_team_id': game.get('home_team_id'),
@@ -2043,6 +2045,29 @@ def log_ml_prediction(conn, r):
         )
     except sqlite3.OperationalError:
         pass
+
+LOCK_WINDOW_SECONDS = 3600  # 1 hour before first pitch
+
+def in_prediction_lock_window(r):
+    """True once this game is within 1 hour of first pitch, or already
+    live/final. Before this point, predictions are left to recalculate
+    freely on every rerun (fresh injury news, lineup changes, updated
+    pitcher/team stats, etc. can all still move the number, which is
+    useful this far out) -- only once the window is entered does
+    apply_locked_ml_prediction start freezing it."""
+    if r.get('abstract_state') in ('Live', 'Final'):
+        return True
+    dt_str = r.get('game_datetime_utc')
+    if not dt_str:
+        # Can't determine start time -- fail toward locking (safer to freeze
+        # too early than to never freeze a game that's actually started).
+        return True
+    try:
+        dt_utc = datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
+        seconds_until_start = (dt_utc - datetime.now(timezone.utc)).total_seconds()
+    except Exception:
+        return True
+    return seconds_until_start <= LOCK_WINDOW_SECONDS
 
 def apply_locked_ml_prediction(conn, r, min_edge, min_prob):
     """Freezes the model's moneyline pick/probability at whatever it was the
@@ -2747,12 +2772,14 @@ with st.spinner(f"Loading real-time stats for {len(games)} game(s) on {date_str}
 
     ml_results = [model_moneyline_game(g, market_map, min_edge_threshold, min_win_prob_threshold, strict_lineup_mode, season, standings_map, ops_leaders_map) for g in games]
 
-# Lock in each game's moneyline pick/probability at its first-ever-logged
-# value (see apply_locked_ml_prediction) before anything below -- sorting,
-# qualifying, parlay-pool building -- reads model_prob/edge/is_qualified.
+# Lock in each game's moneyline pick/probability once it enters its 1-hour-
+# before-first-pitch window (see in_prediction_lock_window /
+# apply_locked_ml_prediction) before anything below -- sorting, qualifying,
+# parlay-pool building -- reads model_prob/edge/is_qualified. Outside that
+# window, predictions are left to recalculate freely on every rerun.
 _pred_conn = get_track_db()
 for r in ml_results:
-    if r['is_ready'] and r.get('game_pk'):
+    if r['is_ready'] and r.get('game_pk') and in_prediction_lock_window(r):
         _ = log_ml_prediction(_pred_conn, r)
         apply_locked_ml_prediction(_pred_conn, r, min_edge_threshold, min_win_prob_threshold)
 try:
@@ -2892,7 +2919,7 @@ def render_live_scores_section(current_date, current_market_map, min_edge, min_p
     # pitcher currently on the mound updates his own season stats mid-game.
     _live_conn = get_track_db()
     for r in current_ml_results:
-        if r['is_ready'] and r.get('game_pk'):
+        if r['is_ready'] and r.get('game_pk') and in_prediction_lock_window(r):
             _ = log_ml_prediction(_live_conn, r)
             apply_locked_ml_prediction(_live_conn, r, min_edge, min_prob)
     try:
