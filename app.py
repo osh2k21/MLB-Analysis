@@ -3058,25 +3058,7 @@ for idx, r in enumerate(non_final_results, 1):
         "Proj. Run Diff": f"{r['projected_run_diff']:.2f}",
     })
 
-df_ml = pd.DataFrame(ml_table_data)
-st.dataframe(
-    df_ml,
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "#": st.column_config.NumberColumn(width="small"),
-        "Status": st.column_config.TextColumn(width="small"),
-        "Matchup": st.column_config.TextColumn(width="small"),
-        "Pitchers": st.column_config.TextColumn(width="medium"),
-        "Score / Time": st.column_config.TextColumn(width="small"),
-        "Pick (Model %)": st.column_config.TextColumn(width="medium"),
-        "Market (Book)": st.column_config.TextColumn(width="medium"),
-        "Edge (pp)": st.column_config.TextColumn(width="small"),
-    }
-)
-
-with st.expander("📋 Show full details (full team/pitcher names, market implied prob, projected run diff)"):
-    st.dataframe(pd.DataFrame(ml_table_data_full), use_container_width=True, hide_index=True)
+st.dataframe(pd.DataFrame(ml_table_data_full), use_container_width=True, hide_index=True)
 
 st.markdown("---")
 
