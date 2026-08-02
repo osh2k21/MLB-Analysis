@@ -1117,6 +1117,7 @@ def fetch_bulk_market_odds(api_key, preferred_key, strict=False):
         return {}, {'status': 'empty', 'detail': 'The Odds API returned 200 OK but an empty game list -- no MLB games currently have odds posted by any tracked book.'}
 
     market_map = {}
+    _pair_dates_seen = {}  # "{away}@{home}" -> set of dates this pair has appeared on so far
     for game in data:
         home_team = game.get('home_team')
         away_team = game.get('away_team')
@@ -1159,13 +1160,25 @@ def fetch_bulk_market_odds(api_key, preferred_key, strict=False):
                     'source_book': book, 'fallback_used': fb
                 }
 
+        pair_key = f"{away_team}@{home_team}"
         if game_date_ct:
-            market_map[f"{game_date_ct}:{away_team}@{home_team}"] = entry
-        # Also keep the old team-only key as a fallback (used only if a
-        # lookup can't resolve a date-qualified match, e.g. commence_time
-        # was missing) -- last-write-wins here same as before, but now it's
-        # a fallback path rather than the only path.
-        market_map[f"{away_team}@{home_team}"] = entry
+            market_map[f"{game_date_ct}:{pair_key}"] = entry
+            _pair_dates_seen.setdefault(pair_key, set()).add(game_date_ct)
+
+        if len(_pair_dates_seen.get(pair_key, set())) <= 1:
+            # This pair has only been seen on one date so far in this bulk
+            # fetch -- safe to keep as an unambiguous fallback for the rare
+            # case a lookup's date-qualified key doesn't resolve (e.g.
+            # commence_time was missing).
+            market_map[pair_key] = entry
+        else:
+            # A back-to-back series: the same two teams now span 2+ dates in
+            # this same fetch. The team-only key can no longer safely point
+            # to just one of them -- remove it rather than let a date-key
+            # mismatch silently fall back to the WRONG day's odds (this is
+            # exactly what caused the same total/moneyline to show up for
+            # both today's and tomorrow's game of a series).
+            market_map.pop(pair_key, None)
 
     if not market_map:
         return market_map, {'status': 'no_games_matched', 'detail': f'The Odds API returned {len(data)} game(s), but none had usable team names/bookmaker data to build a market entry from.'}
@@ -3371,6 +3384,50 @@ if lineups_posted:
         home_lineup_avg_ops = sum(home_found_ops) / len(home_found_ops)
         ops_adjust = max(-0.15, min(0.15, (home_lineup_avg_ops - LEAGUE_AVG_OPS) / LEAGUE_AVG_OPS))
         home_exp = max(1.5, home_exp * (1.0 + ops_adjust * 0.5))
+
+st.markdown("#### 🎯 Game Total (Over/Under) Analysis")
+model_total_exp = away_exp + home_exp
+_model_total_legs = build_model_total_projection(selected_game_item, away_exp, home_exp)
+_over_m = next(l for l in _model_total_legs if ' Over ' in l['desc'])
+_under_m = next(l for l in _model_total_legs if ' Under ' in l['desc'])
+_model_point = round(model_total_exp * 2) / 2.0
+
+# Always shown -- this is the model's own general read on the game, entirely
+# independent of whether any book has posted a line at all.
+total_display_text = (
+    f"⚾ **Model's Projected Total:** {model_total_exp:.2f} combined runs (model's own line: {_model_point})\n\n"
+    f"**Over {_model_point}:** {_over_m['model_prob']*100:.1f}% &nbsp;|&nbsp; "
+    f"**Under {_model_point}:** {_under_m['model_prob']*100:.1f}%"
+)
+
+# Layered on top, only when a real line exists -- how the model's view
+# compares against the actual live market at the market's own point, which
+# can differ from the model's own natural line above.
+real_total_legs_display = build_total_legs(selected_game_item, away_exp, home_exp)
+if real_total_legs_display:
+    line_point = selected_game_item['market_entry']['totals']['point']
+    over_leg = next((l for l in real_total_legs_display if ' Over ' in l['desc']), None)
+    under_leg = next((l for l in real_total_legs_display if ' Under ' in l['desc']), None)
+    rows = []
+    if over_leg:
+        edge = (over_leg['model_prob'] - over_leg['market_prob']) * 100
+        rows.append(
+            f"**Over {line_point}** ({over_leg['odds_str']} via {over_leg['source_book']}): "
+            f"Model {over_leg['model_prob']*100:.1f}% &nbsp;|&nbsp; Market {over_leg['market_prob']*100:.1f}% "
+            f"&nbsp;|&nbsp; Edge {edge:+.1f}pp"
+        )
+    if under_leg:
+        edge = (under_leg['model_prob'] - under_leg['market_prob']) * 100
+        rows.append(
+            f"**Under {line_point}** ({under_leg['odds_str']} via {under_leg['source_book']}): "
+            f"Model {under_leg['model_prob']*100:.1f}% &nbsp;|&nbsp; Market {under_leg['market_prob']*100:.1f}% "
+            f"&nbsp;|&nbsp; Edge {edge:+.1f}pp"
+        )
+    total_display_text += "\n\n---\n\n**📈 Live Market Comparison**\n\n" + "\n\n".join(rows)
+else:
+    total_display_text += "\n\n*No live total line posted for this game yet -- nothing to compare against.*"
+
+st.info(total_display_text)
 
 # Moneyline -- model_prob always comes from model_moneyline_game's own factor
 # model; market fields are only populated when has_ml_market is True.
