@@ -907,6 +907,70 @@ DEFAULT_PARK_FACTOR = 1.00
 def get_park_factor(venue_name):
     return PARK_FACTORS.get(venue_name, DEFAULT_PARK_FACTOR)
 
+def compute_weather_run_factor(weather):
+    """Small multiplicative adjustment to expected runs, from MLB's own
+    per-game weather data (wind speed/direction, temperature) -- this data
+    was already being fetched (hydrate=weather in the schedule call) but
+    was never actually applied anywhere; the model previously only used a
+    static, day-independent park factor.
+
+    Returns (factor, note). factor is 1.0 (no adjustment) whenever weather
+    data is missing, indoors, or unparseable -- consistent with the rest of
+    the app's real-data-only philosophy: never fabricate an adjustment when
+    real conditions for this specific game aren't actually available.
+
+    Effect sizes are intentionally modest and capped -- this is meant to be
+    a real but secondary nudge on top of the pitcher/team-quality-driven
+    projection, not something that can dominate it."""
+    if not weather or not isinstance(weather, dict):
+        return 1.0, "No weather data available for this game."
+
+    condition = str(weather.get('condition', '') or '').lower()
+    wind_str = str(weather.get('wind', '') or '').strip()
+    temp_str = str(weather.get('temp', '') or '').strip()
+
+    if 'roof closed' in condition or 'dome' in condition or 'indoor' in condition:
+        return 1.0, "Indoor/dome game -- climate controlled, no weather adjustment applied."
+
+    factor = 1.0
+    notes = []
+
+    wind_match = re.match(r'(\d+)\s*mph', wind_str, re.IGNORECASE)
+    if wind_match:
+        wind_mph = int(wind_match.group(1))
+        wind_lower = wind_str.lower()
+        if wind_mph >= 5:
+            if 'out to' in wind_lower:
+                # Blowing out helps fly balls/HRs carry -- boosts scoring.
+                boost = min(0.15, (wind_mph - 5) * 0.012)
+                factor += boost
+                notes.append(f"Wind {wind_mph} mph blowing OUT ({boost*100:+.1f}% runs)")
+            elif 'in from' in wind_lower:
+                # Blowing in knocks fly balls down -- suppresses scoring.
+                reduction = min(0.15, (wind_mph - 5) * 0.012)
+                factor -= reduction
+                notes.append(f"Wind {wind_mph} mph blowing IN ({-reduction*100:+.1f}% runs)")
+            else:
+                notes.append(f"Wind {wind_mph} mph crosswind/variable -- negligible run impact")
+        else:
+            notes.append(f"Wind {wind_mph} mph -- light, negligible impact")
+
+    temp_match = re.match(r'(\d+)', temp_str)
+    if temp_match:
+        temp_f = int(temp_match.group(1))
+        # Warmer air is less dense -- ball carries slightly further,
+        # roughly the reverse in cold. ~0.15% total runs per degree away
+        # from a 70F baseline, capped at +/-8% at the extremes.
+        delta = temp_f - 70
+        temp_adj = max(-0.08, min(0.08, delta * 0.0015))
+        factor += temp_adj
+        if abs(temp_adj) >= 0.01:
+            direction = "warmer" if temp_adj > 0 else "colder"
+            notes.append(f"{temp_f}°F ({direction} than 70°F baseline, {temp_adj*100:+.1f}% runs)")
+
+    factor = max(0.85, min(1.15, factor))
+    return factor, ("; ".join(notes) if notes else "No usable wind/temp data for this game.")
+
 def estimate_expected_runs(pitcher_era, opposing_team_runs_pg, park_factor):
     """Blends the starting pitcher's REAL ERA with the opposing team's REAL
     season runs-per-game rate, then applies the park's run-scoring factor.
@@ -1360,6 +1424,8 @@ def model_moneyline_game(game, market_map, min_edge, min_prob, strict_lineup_mod
     home_def = get_team_fielding(game['home_team_id'], season)
 
     park_factor = get_park_factor(game.get('venue', ''))
+    weather_factor, weather_note = compute_weather_run_factor(game.get('weather'))
+    combined_run_factor = park_factor * weather_factor
 
     # ---- 1) Baseline: REAL team quality combined via Log5 ----
     home_win_prob = log5_win_prob(home_quality['quality'], away_quality['quality'])
@@ -1422,8 +1488,8 @@ def model_moneyline_game(game, market_map, min_edge, min_prob, strict_lineup_mod
     # When the two teams project as nearly even on REAL run-scoring rates,
     # damp the model's confidence slightly rather than let a small edge
     # compound into an overconfident number.
-    away_exp_runs = estimate_expected_runs(home_stats['era'], away_quality['runs_pg'], park_factor)
-    home_exp_runs = estimate_expected_runs(away_stats['era'], home_quality['runs_pg'], park_factor)
+    away_exp_runs = estimate_expected_runs(home_stats['era'], away_quality['runs_pg'], combined_run_factor)
+    home_exp_runs = estimate_expected_runs(away_stats['era'], home_quality['runs_pg'], combined_run_factor)
     projected_run_diff = abs(home_exp_runs - away_exp_runs)
     if projected_run_diff < 0.6:
         home_win_prob = 0.5 + (home_win_prob - 0.5) * 0.80
@@ -1510,6 +1576,8 @@ def model_moneyline_game(game, market_map, min_edge, min_prob, strict_lineup_mod
         'home_rest_days': home_rest,
         'away_rest_days': away_rest,
         'park_factor': park_factor,
+        'weather_factor': weather_factor,
+        'weather_note': weather_note,
         'projected_run_diff': projected_run_diff,
         'away_exp_runs': away_exp_runs,
         'home_exp_runs': home_exp_runs,
@@ -3418,13 +3486,16 @@ _model_total_legs = build_model_total_projection(selected_game_item, away_exp, h
 _over_m = next(l for l in _model_total_legs if ' Over ' in l['desc'])
 _under_m = next(l for l in _model_total_legs if ' Under ' in l['desc'])
 _model_point = round(model_total_exp * 2) / 2.0
+_weather_factor = selected_game_item.get('weather_factor', 1.0)
+_weather_note = selected_game_item.get('weather_note', '')
 
 # Always shown -- this is the model's own general read on the game, entirely
 # independent of whether any book has posted a line at all.
 total_display_text = (
     f"⚾ **Model's Projected Total:** {model_total_exp:.2f} combined runs (model's own line: {_model_point})\n\n"
     f"**Over {_model_point}:** {_over_m['model_prob']*100:.1f}% &nbsp;|&nbsp; "
-    f"**Under {_model_point}:** {_under_m['model_prob']*100:.1f}%"
+    f"**Under {_model_point}:** {_under_m['model_prob']*100:.1f}%\n\n"
+    f"🌬️ *Weather adjustment: {_weather_note} (net factor: {_weather_factor:.3f}x on expected runs)*"
 )
 
 # Layered on top, only when a real line exists -- how the model's view
