@@ -3565,7 +3565,7 @@ with col1:
     if selected_game_item.get('away_rest_days') is not None:
         st.caption(f"Rest: {selected_game_item['away_rest_days']} days since last start (real, from game log)")
 
-    k_line_away = st.number_input(f"{selected_game['away_pitcher']} Strikeout Milestone (model-only, custom line)", min_value=1, max_value=15, value=max(1, min(15, int(np.floor(p_stats_away['k_avg'])))), step=1, key="k_away")
+    k_line_away = st.number_input(f"{selected_game['away_pitcher']} Strikeout Milestone (model-only, custom line)", min_value=1, max_value=15, value=max(1, min(15, int(np.floor(p_stats_away['k_avg'])))), step=1, key=f"k_away_{selected_game_item['game_pk']}")
     k_prob_away = calculate_k_prop_prob(k_line_away, p_stats_away['k_avg'])
     st.metric(f"Model Over Prob ({k_line_away}+ Strikeouts)", f"{k_prob_away*100:.1f}%")
     if event_props and 'pitcher_strikeouts' in event_props:
@@ -3596,7 +3596,7 @@ with col2:
     if selected_game_item.get('home_rest_days') is not None:
         st.caption(f"Rest: {selected_game_item['home_rest_days']} days since last start (real, from game log)")
 
-    k_line_home = st.number_input(f"{selected_game['home_pitcher']} Strikeout Milestone (model-only, custom line)", min_value=1, max_value=15, value=max(1, min(15, int(np.floor(p_stats_home['k_avg'])))), step=1, key="k_home")
+    k_line_home = st.number_input(f"{selected_game['home_pitcher']} Strikeout Milestone (model-only, custom line)", min_value=1, max_value=15, value=max(1, min(15, int(np.floor(p_stats_home['k_avg'])))), step=1, key=f"k_home_{selected_game_item['game_pk']}")
     k_prob_home = calculate_k_prop_prob(k_line_home, p_stats_home['k_avg'])
     st.metric(f"Model Over Prob ({k_line_home}+ Strikeouts)", f"{k_prob_home*100:.1f}%")
     if event_props and 'pitcher_strikeouts' in event_props:
