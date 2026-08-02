@@ -513,7 +513,8 @@ def get_real_pitcher_stats(pitcher_id, pitcher_name, team_name=""):
         throws = person.get('pitchHand', {}).get('code', 'R')
 
         era, whip, k9, ip_avg, k_avg = 4.20, 1.30, 8.2, 5.0, 4.5
-        if stats_list and stats_list[0].get('splits'):
+        found_real_splits = bool(stats_list and stats_list[0].get('splits'))
+        if found_real_splits:
             stat = stats_list[0]['splits'][-1]['stat']
             era = float(stat.get('era', 4.20))
             whip = float(stat.get('whip', 1.30))
@@ -539,7 +540,13 @@ def get_real_pitcher_stats(pitcher_id, pitcher_name, team_name=""):
             'ip_avg': ip_avg,
             'k_avg': max(2.0, min(14.0, k_avg)),
             'throws': throws,
-            'is_real': True
+            # Must match found_real_splits, NOT just "no exception was
+            # thrown" -- a structurally-empty-but-technically-successful API
+            # response (stats_list empty or missing splits) previously fell
+            # through to the hardcoded defaults above while still claiming
+            # is_real=True, silently presenting fabricated placeholder
+            # numbers as genuine fetched stats with no warning shown anywhere.
+            'is_real': found_real_splits
         }
     except Exception:
         return default_stats
@@ -3560,6 +3567,13 @@ with col1:
     q_away = selected_game_item['away_quality']
 
     st.markdown(f"**Starting Pitcher:** {selected_game['away_pitcher']} ({'LHP' if p_stats_away['throws']=='L' else 'RHP'})")
+    if not p_stats_away.get('is_real', True):
+        st.warning(
+            f"⚠️ Could not fetch real season stats for {selected_game['away_pitcher']} right now -- "
+            f"the numbers below are a generic league-average placeholder (ERA 4.20, ~4.5 K/game), "
+            f"NOT this pitcher's actual real stats. Treat any prediction using these as unreliable "
+            f"until this clears (usually a temporary MLB API hiccup)."
+        )
     st.write(f"• ERA: **{p_stats_away['era']:.2f}** | Team Staff ERA (real, bullpen/depth proxy): **{q_away['staff_era']:.2f}**")
     st.write(f"• **Team Fielding (real):** FLD%: `{def_away['fielding_pct']:.3f}` | Errors: `{def_away['errors']}`")
     if selected_game_item.get('away_rest_days') is not None:
@@ -3591,6 +3605,13 @@ with col2:
     q_home = selected_game_item['home_quality']
 
     st.markdown(f"**Starting Pitcher:** {selected_game['home_pitcher']} ({'LHP' if p_stats_home['throws']=='L' else 'RHP'})")
+    if not p_stats_home.get('is_real', True):
+        st.warning(
+            f"⚠️ Could not fetch real season stats for {selected_game['home_pitcher']} right now -- "
+            f"the numbers below are a generic league-average placeholder (ERA 4.20, ~4.5 K/game), "
+            f"NOT this pitcher's actual real stats. Treat any prediction using these as unreliable "
+            f"until this clears (usually a temporary MLB API hiccup)."
+        )
     st.write(f"• ERA: **{p_stats_home['era']:.2f}** | Team Staff ERA (real, bullpen/depth proxy): **{q_home['staff_era']:.2f}**")
     st.write(f"• **Team Fielding (real):** FLD%: `{def_home['fielding_pct']:.3f}` | Errors: `{def_home['errors']}`")
     if selected_game_item.get('home_rest_days') is not None:
