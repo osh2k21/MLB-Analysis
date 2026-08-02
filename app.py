@@ -655,7 +655,57 @@ def get_team_fielding(team_id, season):
         pass
     return default
 
-def compute_team_quality(team_id, season, standings_map):
+@st.cache_data(ttl=3600)
+def get_team_recent_form(team_id, game_date_str, num_games=15):
+    """REAL win-loss record over the team's last `num_games` completed
+    games (not their season-to-date standings record), computed directly
+    from actual schedule/results. A team that's been hot or cold recently
+    can look meaningfully different from their flat season-long record --
+    this captures that instead of treating form as constant all year.
+    Returns None if unavailable, so the caller can skip the recency blend
+    entirely rather than fabricate one."""
+    if not team_id or not game_date_str:
+        return None
+    try:
+        game_date = datetime.strptime(game_date_str, "%Y-%m-%d")
+        # Look back far enough in calendar days to almost certainly capture
+        # num_games completed games (~1/day typically, allowing for off-days).
+        start_date = (game_date - timedelta(days=int(num_games * 1.6) + 5)).strftime("%Y-%m-%d")
+        end_date = (game_date - timedelta(days=1)).strftime("%Y-%m-%d")
+        url = (
+            f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&teamId={team_id}"
+            f"&startDate={start_date}&endDate={end_date}"
+        )
+        res = requests.get(url, timeout=6).json()
+        results = []
+        for date_entry in res.get('dates', []):
+            for g in date_entry.get('games', []):
+                if g.get('status', {}).get('abstractGameState') != 'Final':
+                    continue
+                teams = g.get('teams', {})
+                is_home = teams.get('home', {}).get('team', {}).get('id') == team_id
+                side = teams.get('home') if is_home else teams.get('away')
+                other_side = teams.get('away') if is_home else teams.get('home')
+                if not side or not other_side:
+                    continue
+                won = side.get('isWinner')
+                if won is None:
+                    my_score, opp_score = side.get('score'), other_side.get('score')
+                    if my_score is None or opp_score is None:
+                        continue
+                    won = my_score > opp_score
+                results.append((date_entry.get('date', ''), bool(won)))
+
+        results.sort(key=lambda x: x[0])
+        recent = results[-num_games:]
+        if not recent:
+            return None
+        wins = sum(1 for _, w in recent if w)
+        return {'win_pct_recent': wins / len(recent), 'games_counted': len(recent), 'is_real': True}
+    except Exception:
+        return None
+
+def compute_team_quality(team_id, season, standings_map, game_date_str=None):
     """Blends REAL winning percentage (from standings) with REAL
     Pythagorean win expectation (from real runs scored/allowed), then
     regresses toward .500 early in the season when the sample size is
@@ -688,10 +738,21 @@ def compute_team_quality(team_id, season, standings_map):
     shrink_weight = min(1.0, games / 50.0)
     quality = 0.5 + (raw_quality - 0.5) * shrink_weight
 
+    # Recent-form blend (REAL last-15-games record, not season-to-date) --
+    # a team playing meaningfully better/worse than their season number
+    # right now gets a modest nudge toward that recent reality. Weighted at
+    # just 20% so a hot/cold streak can meaningfully move a borderline
+    # matchup without ever overriding the much larger season-long sample.
+    recent_form = get_team_recent_form(team_id, game_date_str) if game_date_str else None
+    if recent_form and recent_form['games_counted'] >= 8:
+        quality = quality * 0.8 + recent_form['win_pct_recent'] * 0.2
+
     return {
         'quality': quality, 'win_pct': win_pct, 'pythag_pct': pythag_pct, 'games': games,
         'runs_pg': run_env['runs_pg'], 'runs_allowed_pg': run_env['runs_allowed_pg'],
-        'staff_era': run_env['staff_era'], 'is_real': (record is not None) or run_env['is_real']
+        'staff_era': run_env['staff_era'], 'is_real': (record is not None) or run_env['is_real'],
+        'recent_form_win_pct': recent_form['win_pct_recent'] if recent_form else None,
+        'recent_form_games': recent_form['games_counted'] if recent_form else 0
     }
 
 def log5_win_prob(quality_a, quality_b):
@@ -705,6 +766,113 @@ def log5_win_prob(quality_a, quality_b):
     return (quality_a - quality_a * quality_b) / denom
 
 @st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600)
+def get_bullpen_recent_workload(team_id, game_date_str, lookback_days=3):
+    """REAL relief-pitching workload (innings, excluding the starter) for
+    this team over the `lookback_days` before game_date_str, computed from
+    the actual final boxscores of their own recent games -- not a guess.
+    A team whose bullpen has thrown heavy innings the last few days is
+    genuinely more likely to be gassed/less effective tonight than the
+    season-long staff ERA alone would suggest. Returns None if this can't
+    be determined (schedule/boxscore fetch failed), so the caller can skip
+    the fatigue adjustment entirely rather than fabricate one."""
+    if not team_id or not game_date_str:
+        return None
+    try:
+        game_date = datetime.strptime(game_date_str, "%Y-%m-%d")
+        start_date = (game_date - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        end_date = (game_date - timedelta(days=1)).strftime("%Y-%m-%d")
+        sched_url = (
+            f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&teamId={team_id}"
+            f"&startDate={start_date}&endDate={end_date}"
+        )
+        sched = requests.get(sched_url, timeout=6).json()
+        game_pks = []
+        for date_entry in sched.get('dates', []):
+            for g in date_entry.get('games', []):
+                if g.get('status', {}).get('abstractGameState') == 'Final':
+                    game_pks.append(g.get('gamePk'))
+
+        if not game_pks:
+            # No recent games found (off-days, start of season) -- a fully
+            # rested bullpen, not an error.
+            return {'bullpen_ip_recent': 0.0, 'games_checked': 0, 'is_real': True}
+
+        total_bullpen_ip = 0.0
+        for pk in game_pks:
+            box = requests.get(f"https://statsapi.mlb.com/api/v1/game/{pk}/boxscore", timeout=6).json()
+            for side in ('home', 'away'):
+                team_box = box.get('teams', {}).get(side, {})
+                if team_box.get('team', {}).get('id') != team_id:
+                    continue
+                pitcher_ids = team_box.get('pitchers', [])
+                players = team_box.get('players', {})
+                for idx, pid in enumerate(pitcher_ids):
+                    if idx == 0:
+                        continue  # first pitcher used = the starter, skip -- relievers only
+                    entry = players.get(f"ID{pid}")
+                    if entry:
+                        ip_str = entry.get('stats', {}).get('pitching', {}).get('inningsPitched', '0.0')
+                        try:
+                            total_bullpen_ip += float(ip_str)
+                        except (TypeError, ValueError):
+                            pass
+
+        return {'bullpen_ip_recent': round(total_bullpen_ip, 1), 'games_checked': len(game_pks), 'is_real': True}
+    except Exception:
+        return None
+
+def bullpen_fatigue_penalty(workload):
+    """Win-prob penalty for a fatigued bullpen. ~3 IP/day is a normal
+    bullpen workload -- so 3 games * 3 IP/day = 9 IP is treated as the
+    neutral baseline over a 3-day lookback. Innings beyond that nudge the
+    penalty up, capped at 5pp so a heavy stretch can't dominate the model."""
+    if workload is None or not workload.get('is_real'):
+        return 0.0
+    baseline = 9.0
+    excess = max(0.0, workload['bullpen_ip_recent'] - baseline)
+    return min(0.05, excess * 0.006)
+
+@st.cache_data(ttl=3600)
+def get_travel_fatigue_flag(team_id, game_date_str, todays_venue):
+    """REAL travel-fatigue signal: did this team play YESTERDAY in a
+    DIFFERENT ballpark than today's game? A same-day-turnaround trip to a
+    new city is a real, quantifiable fatigue factor -- distinct from
+    pitcher rest days, which only track the starter's own rest, not the
+    whole team's travel burden. Returns None if this can't be determined,
+    so the caller can skip the adjustment entirely rather than guess."""
+    if not team_id or not game_date_str or not todays_venue:
+        return None
+    try:
+        game_date = datetime.strptime(game_date_str, "%Y-%m-%d")
+        yesterday = (game_date - timedelta(days=1)).strftime("%Y-%m-%d")
+        url = (
+            f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&teamId={team_id}"
+            f"&startDate={yesterday}&endDate={yesterday}"
+        )
+        res = requests.get(url, timeout=6).json()
+        for date_entry in res.get('dates', []):
+            for g in date_entry.get('games', []):
+                if g.get('status', {}).get('abstractGameState') != 'Final':
+                    continue
+                venue = g.get('venue', {}).get('name', '')
+                if venue:
+                    return {'traveled': venue != todays_venue, 'prior_venue': venue, 'is_real': True}
+        # No completed game found yesterday -- at least a full day off,
+        # so no same-day-turnaround travel fatigue to flag.
+        return {'traveled': False, 'prior_venue': None, 'is_real': True}
+    except Exception:
+        return None
+
+def travel_fatigue_penalty(travel_info):
+    """Small, fixed win-prob penalty for a same-day-turnaround trip to a
+    new ballpark the day before -- a real but modest fatigue factor, kept
+    deliberately small since travel effects on performance are real but
+    not huge."""
+    if travel_info is None or not travel_info.get('is_real'):
+        return 0.0
+    return 0.012 if travel_info.get('traveled') else 0.0
+
 def get_pitcher_rest_days(pitcher_id, game_date_str, season):
     """REAL days of rest since the starter's last appearance, computed from
     his actual MLB game log. Returns None (not a guess) if unavailable, so
@@ -745,6 +913,31 @@ def get_team_platoon_ops(team_id, season, vs_hand):
     sit_code = 'vl' if vs_hand == 'L' else 'vr'
     try:
         url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season&group=hitting&season={season}&sitCodes={sit_code}"
+        res = requests.get(url, timeout=6).json()
+        splits = res.get('stats', [{}])[0].get('splits', [])
+        if splits:
+            ops = splits[0]['stat'].get('ops')
+            if ops not in (None, '', '.---'):
+                return float(ops)
+    except Exception:
+        pass
+    return None
+
+@st.cache_data(ttl=3600)
+def get_player_platoon_ops(player_id, season, vs_hand):
+    """Same idea as get_team_platoon_ops, but for one individual hitter --
+    a team-wide platoon average can mask hitters with much more extreme
+    individual platoon splits than their team as a whole. Used for the
+    confirmed-lineup analysis in the Deep-Dive tab (NOT applied across the
+    full slate, matching get_lineup_hitters' own scoping -- fetching this
+    per-hitter for every game in a slate would be far too slow, even
+    though these are free MLB Stats API calls with no credit cost).
+    Returns None if unavailable/unparseable, never a guess."""
+    if not player_id:
+        return None
+    sit_code = 'vl' if vs_hand == 'L' else 'vr'
+    try:
+        url = f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats?stats=season&group=hitting&season={season}&sitCodes={sit_code}"
         res = requests.get(url, timeout=6).json()
         splits = res.get('stats', [{}])[0].get('splits', [])
         if splits:
@@ -839,11 +1032,11 @@ def get_lineup_hitters(lineup, ops_leaders_by_player, season, max_players=9):
         leader_hit = ops_leaders_by_player.get(pid)
         if leader_hit and leader_hit.get('ops') is not None:
             ba = get_player_batting_average(pid, season)  # cached; cheap if already fetched elsewhere
-            results.append({'name': name, 'ba': ba if ba is not None else 0.250, 'ops': leader_hit['ops'], 'is_real': ba is not None})
+            results.append({'id': pid, 'name': name, 'ba': ba if ba is not None else 0.250, 'ops': leader_hit['ops'], 'is_real': ba is not None})
         else:
             stats = get_player_hitting_stats(pid, season)
             if stats:
-                results.append({'name': name, 'ba': stats['avg'], 'ops': stats.get('ops'), 'is_real': True})
+                results.append({'id': pid, 'name': name, 'ba': stats['avg'], 'ops': stats.get('ops'), 'is_real': True})
     return results
 
 def get_key_hitter_for_team(team_id, team_name, season, ops_leaders_map):
@@ -1414,8 +1607,8 @@ def model_moneyline_game(game, market_map, min_edge, min_prob, strict_lineup_mod
     away_stats = get_real_pitcher_stats(game['away_pitcher_id'], game['away_pitcher'], game['away_team'])
     home_stats = get_real_pitcher_stats(game['home_pitcher_id'], game['home_pitcher'], game['home_team'])
 
-    away_quality = compute_team_quality(game['away_team_id'], season, standings_map)
-    home_quality = compute_team_quality(game['home_team_id'], season, standings_map)
+    away_quality = compute_team_quality(game['away_team_id'], season, standings_map, game.get('game_date'))
+    home_quality = compute_team_quality(game['home_team_id'], season, standings_map, game.get('game_date'))
 
     away_hitter = get_key_hitter_for_team(game['away_team_id'], game['away_team'], season, ops_leaders_map)
     home_hitter = get_key_hitter_for_team(game['home_team_id'], game['home_team'], season, ops_leaders_map)
@@ -1472,6 +1665,17 @@ def model_moneyline_game(game, market_map, min_edge, min_prob, strict_lineup_mod
         return -0.012 if rest_days < 4 else 0.0
 
     home_win_prob += rest_penalty(home_rest) - rest_penalty(away_rest)
+
+    # ---- 6.5) Bullpen fatigue (REAL recent relief workload from actual boxscores) ----
+    home_bullpen_workload = get_bullpen_recent_workload(game['home_team_id'], game.get('game_date', ''))
+    away_bullpen_workload = get_bullpen_recent_workload(game['away_team_id'], game.get('game_date', ''))
+    home_win_prob += bullpen_fatigue_penalty(away_bullpen_workload) - bullpen_fatigue_penalty(home_bullpen_workload)
+
+    # ---- 6.6) Travel fatigue (REAL: played a different ballpark yesterday?) ----
+    todays_venue = game.get('venue', '')
+    home_travel = get_travel_fatigue_flag(game['home_team_id'], game.get('game_date', ''), todays_venue)
+    away_travel = get_travel_fatigue_flag(game['away_team_id'], game.get('game_date', ''), todays_venue)
+    home_win_prob += travel_fatigue_penalty(away_travel) - travel_fatigue_penalty(home_travel)
 
     # ---- 7) Best-effort REAL platoon/handedness split ----
     # Skipped entirely (edge = 0) if the live split call doesn't return
@@ -3479,6 +3683,30 @@ if lineups_posted:
         home_lineup_avg_ops = sum(home_found_ops) / len(home_found_ops)
         ops_adjust = max(-0.15, min(0.15, (home_lineup_avg_ops - LEAGUE_AVG_OPS) / LEAGUE_AVG_OPS))
         home_exp = max(1.5, home_exp * (1.0 + ops_adjust * 0.5))
+
+    # Individual-hitter platoon nudge: a team-wide platoon OPS (used in the
+    # main win-prob model for the whole slate) can mask hitters with much
+    # more extreme individual splits than their team as a whole. Here --
+    # scoped to just this one selected game, same as the lineup-OPS nudge
+    # above -- each confirmed hitter's OWN OPS specifically against the
+    # OPPOSING starter's throwing hand is fetched and averaged, giving a
+    # sharper read than the team-wide number for today's specific matchup.
+    away_platoon_vals = [
+        v for v in (get_player_platoon_ops(h['id'], season, selected_game_item['home_stats']['throws']) for h in away_lineup_hitters)
+        if v is not None
+    ]
+    home_platoon_vals = [
+        v for v in (get_player_platoon_ops(h['id'], season, selected_game_item['away_stats']['throws']) for h in home_lineup_hitters)
+        if v is not None
+    ]
+    if away_platoon_vals:
+        away_platoon_avg = sum(away_platoon_vals) / len(away_platoon_vals)
+        platoon_adjust = max(-0.12, min(0.12, (away_platoon_avg - LEAGUE_AVG_OPS) / LEAGUE_AVG_OPS))
+        away_exp = max(1.5, away_exp * (1.0 + platoon_adjust * 0.3))
+    if home_platoon_vals:
+        home_platoon_avg = sum(home_platoon_vals) / len(home_platoon_vals)
+        platoon_adjust = max(-0.12, min(0.12, (home_platoon_avg - LEAGUE_AVG_OPS) / LEAGUE_AVG_OPS))
+        home_exp = max(1.5, home_exp * (1.0 + platoon_adjust * 0.3))
 
 st.markdown("#### 🎯 Game Total (Over/Under) Analysis")
 model_total_exp = away_exp + home_exp
