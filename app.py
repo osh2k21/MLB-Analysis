@@ -2416,6 +2416,71 @@ def in_prediction_lock_window(r):
         return True
     return seconds_until_start <= LOCK_WINDOW_SECONDS
 
+def get_calibration_lookup(conn):
+    """Bucket-level (model probability range -> actual historical win rate)
+    calibration data, computed fresh from every RESOLVED moneyline pick in
+    the rolling tracking window -- the exact same underlying data already
+    shown in the Track Record tab's calibration table. Returns a list of
+    (low, high, empirical_win_rate, sample_size) tuples, one per bucket
+    that has at least one resolved pick. Recomputed on each call (cheap --
+    one indexed query) rather than long-term cached, since new games
+    resolve throughout the day and this should reflect the latest
+    available history, not a stale snapshot."""
+    try:
+        rows = conn.execute(
+            "SELECT model_prob, result FROM ml_predictions WHERE resolved = 1 AND result IN ('win', 'loss')"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    if not rows:
+        return []
+
+    bucket_edges = [0.50, 0.55, 0.60, 0.65, 0.70, 0.80, 0.90, 1.01]
+    buckets = []
+    for i in range(len(bucket_edges) - 1):
+        lo, hi = bucket_edges[i], bucket_edges[i + 1]
+        in_bucket = [(p, res) for p, res in rows if lo <= p < hi]
+        if not in_bucket:
+            continue
+        wins = sum(1 for _, res in in_bucket if res == 'win')
+        buckets.append((lo, hi, wins / len(in_bucket), len(in_bucket)))
+    return buckets
+
+def apply_calibration_correction(r, calibration_lookup, min_edge, min_prob, min_sample=30):
+    """Nudges r['model_prob'] toward the empirically-observed win rate for
+    its probability bucket -- but ONLY once that bucket has at least
+    `min_sample` resolved historical picks (matching the exact same
+    sample-size threshold already flagged in the Track Record tab's
+    calibration table), so a correction is never applied based on noise
+    from a handful of games. The original raw model probability is always
+    kept too (r['model_prob_raw']), so the correction is fully visible and
+    reversible, never a silent swap. This is what actually closes the
+    loop: the model's own tracked accuracy now feeds back into its live
+    predictions, using only its own real historical outcomes -- no new
+    external data source."""
+    raw_prob = r['model_prob']
+    r['model_prob_raw'] = raw_prob
+    r['calibration_applied'] = False
+    r['calibration_sample_size'] = 0
+
+    for lo, hi, empirical_rate, n in calibration_lookup:
+        if lo <= raw_prob < hi:
+            r['calibration_sample_size'] = n
+            if n >= min_sample:
+                r['model_prob'] = empirical_rate
+                r['calibration_applied'] = True
+            break
+
+    # Keep fair odds/edge/qualification consistent with whichever
+    # model_prob is now in effect (raw or calibrated) -- same recompute
+    # pattern as apply_locked_ml_prediction, applied here on top of it.
+    r['fair_odds'] = prob_to_american(r['model_prob'])
+    r['fair_multiplier'] = prob_to_multiplier(r['model_prob'])
+    if r.get('has_ml_market') and r.get('implied_prob') is not None:
+        r['edge'] = (r['model_prob'] - r['implied_prob']) * 100.0
+        r['is_qualified'] = r['is_ready'] and (r['edge'] >= min_edge) and (r['model_prob'] >= max(min_prob, 0.58))
+    return r
+
 def apply_locked_ml_prediction(conn, r, min_edge, min_prob):
     """Freezes the model's moneyline pick/probability at whatever it was the
     FIRST time this game was ever logged today (log_ml_prediction is a
@@ -3175,10 +3240,13 @@ with st.spinner(f"Loading real-time stats for {len(games)} game(s) on {date_str}
 # parlay-pool building -- reads model_prob/edge/is_qualified. Outside that
 # window, predictions are left to recalculate freely on every rerun.
 _pred_conn = get_track_db()
+_calibration_lookup = get_calibration_lookup(_pred_conn)
 for r in ml_results:
-    if r['is_ready'] and r.get('game_pk') and in_prediction_lock_window(r):
-        _ = log_ml_prediction(_pred_conn, r)
-        apply_locked_ml_prediction(_pred_conn, r, min_edge_threshold, min_win_prob_threshold)
+    if r['is_ready'] and r.get('game_pk'):
+        if in_prediction_lock_window(r):
+            _ = log_ml_prediction(_pred_conn, r)
+            apply_locked_ml_prediction(_pred_conn, r, min_edge_threshold, min_win_prob_threshold)
+        apply_calibration_correction(r, _calibration_lookup, min_edge_threshold, min_win_prob_threshold)
 try:
     _pred_conn.commit()
 except sqlite3.OperationalError:
@@ -3388,10 +3456,13 @@ def render_live_scores_section(current_date, current_market_map, min_edge, min_p
     # a live-drifting pick/probability would be most visible, since the
     # pitcher currently on the mound updates his own season stats mid-game.
     _live_conn = get_track_db()
+    _live_calibration_lookup = get_calibration_lookup(_live_conn)
     for r in current_ml_results:
-        if r['is_ready'] and r.get('game_pk') and in_prediction_lock_window(r):
-            _ = log_ml_prediction(_live_conn, r)
-            apply_locked_ml_prediction(_live_conn, r, min_edge, min_prob)
+        if r['is_ready'] and r.get('game_pk'):
+            if in_prediction_lock_window(r):
+                _ = log_ml_prediction(_live_conn, r)
+                apply_locked_ml_prediction(_live_conn, r, min_edge, min_prob)
+            apply_calibration_correction(r, _live_calibration_lookup, min_edge, min_prob)
     try:
         _live_conn.commit()
     except sqlite3.OperationalError:
@@ -3554,6 +3625,10 @@ for idx, r in enumerate(non_final_results, 1):
         "Score / State": score_display_full,
         "Algorithmic Pick": f"👉 {r['pick']}",
         "Model Win Prob (%)": f"{r['model_prob']*100:.1f}%",
+        "Calibrated?": (
+            f"✅ was {r['model_prob_raw']*100:.1f}% (n={r['calibration_sample_size']})"
+            if r.get('calibration_applied') else "—"
+        ),
         "Market Odds": r['market_odds_str'],
         "Market Implied Prob (%)": f"{r['implied_prob']*100:.1f}%" if r['has_ml_market'] else "—",
         "Edge (pp)": f"{r['edge']:+.1f}" if r['edge'] is not None else "—",
@@ -3562,6 +3637,11 @@ for idx, r in enumerate(non_final_results, 1):
     })
 
 st.dataframe(pd.DataFrame(ml_table_data_full), use_container_width=True, hide_index=True)
+st.caption(
+    "🎯 **Calibrated?** column: when the model's historical track record shows a given probability range has "
+    "been over/underconfident (30+ resolved picks in that range), \"Model Win Prob\" above is the corrected "
+    "number and this column shows what the model's raw, uncorrected number actually was."
+)
 
 st.markdown("---")
 
@@ -4510,8 +4590,10 @@ def render_all_ml_predictions(conn):
         st.dataframe(pd.DataFrame(calib_rows), hide_index=True, use_container_width=True)
         st.caption(
             "This is the complete picture -- every pick, not just the confident ones that made it into a parlay. "
-            "If, say, '55-60%' picks are actually winning less than 55-60% of the time, that's a real, useful signal "
-            "the model runs overconfident in close games -- something the parlay-only view above would never show you."
+            "🎯 **This table now actively feeds back into live predictions:** any bucket with 30+ resolved picks "
+            "here is used to auto-correct that same probability range going forward (see the 'Calibrated?' "
+            "column in the Full Slate table) -- so if '55-60%' picks are actually winning less than 55-60% of "
+            "the time, future 55-60% predictions get nudged toward the real observed rate, not just flagged here."
         )
     else:
         st.info("Not enough resolved picks yet to build a calibration table.")
