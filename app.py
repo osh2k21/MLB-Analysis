@@ -12,6 +12,7 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import os
+import time
 
 # The parallel pre-warming used throughout this app (team/pitcher stats,
 # Kalshi prop/margin lookups, box-score settlement) runs real network calls
@@ -496,7 +497,15 @@ def get_real_pitcher_stats(pitcher_id, pitcher_name, team_name=""):
     the live call fails, falls back to a neutral league-average default,
     clearly flagged via is_real=False, rather than inventing pitcher-
     specific noise. This is a model INPUT, not a bet; it never determines
-    what odds or lines are shown to the user."""
+    what odds or lines are shown to the user.
+
+    Retries up to 3 times (5 seconds apart) before giving up -- a transient
+    MLB API hiccup (empty response, brief network blip) would otherwise
+    trigger the fallback once and then stay stuck showing placeholder stats
+    for the full hour-long cache, since the whole point of caching is to
+    NOT re-hit the API again until the cache expires. Retrying here, before
+    the result ever gets cached, means only a genuinely persistent outage
+    (not a one-off blip) actually results in a cached fallback."""
     default_stats = {
         'era': 4.20, 'whip': 1.30, 'k9': 8.2, 'ip_avg': 5.0, 'k_avg': 4.5,
         'throws': 'R', 'is_real': False
@@ -506,50 +515,61 @@ def get_real_pitcher_stats(pitcher_id, pitcher_name, team_name=""):
         return default_stats
 
     url = f"https://statsapi.mlb.com/api/v1/people/{pitcher_id}?hydrate=stats(group=[pitching],type=[season])"
-    try:
-        res = requests.get(url, timeout=6).json()
-        person = res.get('people', [{}])[0]
-        stats_list = person.get('stats', [])
-        throws = person.get('pitchHand', {}).get('code', 'R')
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            res = requests.get(url, timeout=6).json()
+            person = res.get('people', [{}])[0]
+            stats_list = person.get('stats', [])
+            throws = person.get('pitchHand', {}).get('code', 'R')
 
-        era, whip, k9, ip_avg, k_avg = 4.20, 1.30, 8.2, 5.0, 4.5
-        found_real_splits = bool(stats_list and stats_list[0].get('splits'))
-        if found_real_splits:
-            stat = stats_list[0]['splits'][-1]['stat']
-            era = float(stat.get('era', 4.20))
-            whip = float(stat.get('whip', 1.30))
-            k9 = float(stat.get('strikeoutsPer9Inn', 8.2))
-            games = int(stat.get('gamesStarted', stat.get('gamesPlayed', 1)))
-            innings = float(stat.get('inningsPitched', 5.0))
-            ip_avg = max(3.0, min(7.0, round(innings / max(1, games), 1)))
-            # Small-sample pitchers (a rookie call-up, a single long relief
-            # outing, very few starts logged) can produce a wildly inflated
-            # K/9 rate on their own -- e.g. 1 IP with 3 Ks is a 27.0 K/9. This
-            # was previously only floored, not capped, and a resulting
-            # extreme k_avg (like 35) could crash the strikeout-milestone
-            # widget downstream, which validates its own default value
-            # against a max of 15. Capped here at the same realistic ceiling
-            # so it can never propagate an unrealistic number anywhere else
-            # that uses this as a model input.
-            k_avg = round((k9 / 9.0) * ip_avg, 1)
+            era, whip, k9, ip_avg, k_avg = 4.20, 1.30, 8.2, 5.0, 4.5
+            found_real_splits = bool(stats_list and stats_list[0].get('splits'))
+            if found_real_splits:
+                stat = stats_list[0]['splits'][-1]['stat']
+                era = float(stat.get('era', 4.20))
+                whip = float(stat.get('whip', 1.30))
+                k9 = float(stat.get('strikeoutsPer9Inn', 8.2))
+                games = int(stat.get('gamesStarted', stat.get('gamesPlayed', 1)))
+                innings = float(stat.get('inningsPitched', 5.0))
+                ip_avg = max(3.0, min(7.0, round(innings / max(1, games), 1)))
+                # Small-sample pitchers (a rookie call-up, a single long relief
+                # outing, very few starts logged) can produce a wildly inflated
+                # K/9 rate on their own -- e.g. 1 IP with 3 Ks is a 27.0 K/9. This
+                # was previously only floored, not capped, and a resulting
+                # extreme k_avg (like 35) could crash the strikeout-milestone
+                # widget downstream, which validates its own default value
+                # against a max of 15. Capped here at the same realistic ceiling
+                # so it can never propagate an unrealistic number anywhere else
+                # that uses this as a model input.
+                k_avg = round((k9 / 9.0) * ip_avg, 1)
 
-        return {
-            'era': era,
-            'whip': whip,
-            'k9': k9,
-            'ip_avg': ip_avg,
-            'k_avg': max(2.0, min(14.0, k_avg)),
-            'throws': throws,
-            # Must match found_real_splits, NOT just "no exception was
-            # thrown" -- a structurally-empty-but-technically-successful API
-            # response (stats_list empty or missing splits) previously fell
-            # through to the hardcoded defaults above while still claiming
-            # is_real=True, silently presenting fabricated placeholder
-            # numbers as genuine fetched stats with no warning shown anywhere.
-            'is_real': found_real_splits
-        }
-    except Exception:
-        return default_stats
+            if found_real_splits or attempt == max_attempts - 1:
+                # Either got real data, or this was the last attempt -- return
+                # now either way (on the final attempt, this returns the
+                # placeholder defaults with is_real=False, same as before).
+                return {
+                    'era': era,
+                    'whip': whip,
+                    'k9': k9,
+                    'ip_avg': ip_avg,
+                    'k_avg': max(2.0, min(14.0, k_avg)),
+                    'throws': throws,
+                    # Must match found_real_splits, NOT just "no exception was
+                    # thrown" -- a structurally-empty-but-technically-successful
+                    # API response (stats_list empty or missing splits)
+                    # previously fell through to the hardcoded defaults above
+                    # while still claiming is_real=True, silently presenting
+                    # fabricated placeholder numbers as genuine fetched stats
+                    # with no warning shown anywhere.
+                    'is_real': found_real_splits
+                }
+            time.sleep(5)  # empty response, but attempts remain -- wait and retry
+        except Exception:
+            if attempt == max_attempts - 1:
+                return default_stats
+            time.sleep(5)  # network hiccup, but attempts remain -- wait and retry
+    return default_stats  # unreachable in practice, safety net only
 
 @st.cache_data(ttl=1800)
 def get_league_standings(season):
