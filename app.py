@@ -3820,6 +3820,95 @@ st.caption(
 st.markdown("---")
 
 # -----------------------------------------------------------------------------
+# SECTION 4B: IMMEDIATE FULL-SLATE BET RECOMMENDATION TABLE
+# -----------------------------------------------------------------------------
+st.markdown("### 🎟️ Model Bet Recommendations — Full Slate")
+st.caption(
+    "These are real currently posted moneyline, run-line, and game-total prices. Nothing without a sportsbook "
+    "price is labeled playable. PLAY clears your probability and edge settings; LEAN has smaller positive "
+    "edge; WAIT is a preliminary projection; PASS has no positive model edge. Player props appear in the "
+    "expanded Playable Bet Board below when the prop toggle is enabled and the book has posted them."
+)
+
+_slate_bet_rows = []
+
+def _append_slate_bet(r, bet_type, leg, model_used):
+    if not leg or not leg.get('has_market', True) or leg.get('market_prob') is None:
+        return
+    edge_pp = (leg['model_prob'] - leg['market_prob']) * 100.0
+    floor = 0.58 if bet_type == 'Moneyline' else 0.60
+    if not r.get('recommendation_ready', False):
+        rating = '🟡 WAIT'
+        rating_order = 2
+    elif leg['model_prob'] >= floor and edge_pp >= min_edge_threshold:
+        rating = '✅ PLAY'
+        rating_order = 0
+    elif edge_pp > 0:
+        rating = '🟢 LEAN'
+        rating_order = 1
+    else:
+        rating = '⚪ PASS'
+        rating_order = 3
+    _slate_bet_rows.append({
+        '_order': rating_order,
+        '_edge': edge_pp,
+        'Rating': rating,
+        'Time (CT)': r['time_ct'],
+        'Matchup': r['game'],
+        'Bet Type': bet_type,
+        'Model Pick / Bet': leg['desc'],
+        'Model Used': model_used,
+        'Model Prob': f"{leg['model_prob']*100:.1f}%",
+        'Market Prob': f"{leg['market_prob']*100:.1f}%",
+        'Edge': f"{edge_pp:+.1f}pp",
+        'Odds': leg['odds_str'],
+        'Book': leg['source_book'],
+        'Stage': r.get('prediction_stage', '—'),
+    })
+
+for _r in non_final_results:
+    if not _r.get('is_ready'):
+        continue
+    if _r.get('has_ml_market'):
+        _append_slate_bet(_r, 'Moneyline', {
+            'desc': f"{_r['pick']} Moneyline",
+            'model_prob': _r['model_prob'],
+            'market_prob': _r['implied_prob'],
+            'odds_str': _r['market_odds_str'],
+            'source_book': _r['source_book'],
+            'has_market': True,
+        }, '5-model calibrated ensemble')
+    _append_slate_bet(
+        _r, 'Run Line', build_run_line_leg(_r), 'Ensemble-derived run-line model'
+    )
+    for _total_leg in build_total_legs(_r, _r['away_exp_runs'], _r['home_exp_runs'], is_kalshi=strict_kalshi):
+        _append_slate_bet(_r, 'Game Total', _total_leg, 'Poisson runs model')
+
+_slate_bet_rows.sort(key=lambda row: (row['_order'], -row['_edge']))
+_visible_slate_rows = [{k: v for k, v in row.items() if not k.startswith('_')} for row in _slate_bet_rows]
+_recommended_slate_rows = [
+    {k: v for k, v in row.items() if not k.startswith('_')}
+    for row in _slate_bet_rows if row['_order'] in (0, 1)
+]
+
+_slate_tab1, _slate_tab2 = st.tabs([
+    f"✅ Plays & Leans ({len(_recommended_slate_rows)})",
+    f"📋 Every Posted Bet ({len(_visible_slate_rows)})",
+])
+with _slate_tab1:
+    if _recommended_slate_rows:
+        st.dataframe(pd.DataFrame(_recommended_slate_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No positive-edge real-price bets currently qualify. The second tab still shows every posted line as WAIT/PASS.")
+with _slate_tab2:
+    if _visible_slate_rows:
+        st.dataframe(pd.DataFrame(_visible_slate_rows), use_container_width=True, hide_index=True)
+    else:
+        st.warning("No real sportsbook prices were returned for this slate. Check the Odds API key/credit balance and selected sportsbook.")
+
+st.markdown("---")
+
+# -----------------------------------------------------------------------------
 # SECTION 5: DEEP DIVE SELECTOR
 # -----------------------------------------------------------------------------
 st.markdown("### 🎯 Live Game & Advanced Variables Deep-Dive Selector")
@@ -3845,7 +3934,11 @@ st.markdown("---")
 # -----------------------------------------------------------------------------
 st.markdown(f"### 📊 Advanced Deep-Dive Analysis: {selected_game['away_team']} @ {selected_game['home_team']} ({selected_game['game_time_ct']})")
 
-gate_status_text = "Passed" if selected_game_item['is_ready'] else f"Withheld ({selected_game_item['warning_reason']})"
+gate_status_text = (
+    f"Bet-ready — {selected_game_item.get('prediction_stage', 'current data')}"
+    if selected_game_item.get('recommendation_ready')
+    else f"Preliminary — {selected_game_item.get('prediction_stage', selected_game_item['warning_reason'])}"
+)
 aq = selected_game_item['away_quality']
 hq = selected_game_item['home_quality']
 away_quality_text = f"{aq['win_pct']*100:.1f}% win rate" + (f", {aq['pythag_pct']*100:.1f}% Pythagorean" if aq['pythag_pct'] is not None else "") + f" ({aq['games']} G)"
@@ -3875,9 +3968,11 @@ if include_props and selected_game_item.get('market_entry') and selected_game_it
 
 cand_bets = []
 
-# Applies to Run Line, Game Total, Pitcher Strikeout Prop, and Batter Hit Prop
-# only -- Moneyline keeps its own separate threshold/logic below, untouched.
-MIN_PROP_MODEL_PROB = 0.70
+# Applies to Run Line, Game Total, Pitcher Strikeout Prop, and Batter Hit Prop.
+# The old 70-73% gate hid nearly every ordinary -110 market. A 60% estimate
+# can already represent useful value when the no-vig market probability is
+# around 50%, so show it and let the edge/status columns communicate strength.
+MIN_PROP_MODEL_PROB = 0.60
 
 def add_cand(bet_type, desc, leg):
     if leg.get('has_market') and leg.get('market_prob') is not None:
@@ -4222,12 +4317,12 @@ st.caption(
     "1/probability number."
 )
 
-_ready_games_count = sum(1 for _r in ml_results_sorted if _r['is_ready'])
+_ready_games_count = sum(1 for _r in ml_results_sorted if _r.get('recommendation_ready', False))
 _total_games_count = len(ml_results_sorted)
 if _total_games_count > 0 and _ready_games_count < _total_games_count:
     st.info(
-        f"ℹ️ **{_ready_games_count} of {_total_games_count} games today have announced pitchers** and are "
-        f"eligible for legs right now -- the rest are skipped until MLB confirms their starters. If parlays "
+        f"ℹ️ **{_ready_games_count} of {_total_games_count} games are currently bet-ready** and are "
+        f"eligible for strong-play legs -- the rest remain visible as preliminary projections. If parlays "
         f"feel repetitive, this is very often why: there may just not be much else eligible yet. See the "
         f"Player Props Diagnostic below for the full breakdown."
     )
@@ -4244,19 +4339,19 @@ rng = random.Random(st.session_state.parlay_seed)
 # Diagnostic counters for the player-props pipeline. Since prop legs depend on
 # a chain of things all lining up (toggle on -> game has an event_id -> the
 # book has posted a line for that specific pitcher/hitter -> the model clears
-# 73%), it's easy for legs to silently disappear at any link. These counters
+# the PLAY probability/edge gate), it's easy for legs to silently disappear at any link. These counters
 # surface exactly which link is failing instead of just showing "no props."
 props_diag = {
     'eligible_games': 0,       # games where we even attempt an event-props fetch
     'games_with_props_data': 0,  # of those, how many returned ANY market data
     'k_legs_built': 0,         # strikeout legs built (book had a line + name matched)
-    'k_legs_passed_73': 0,     # of those, how many cleared the 73% model-prob bar
+    'k_legs_passed_73': 0,     # legacy key name; now counts rows clearing the PLAY gate
     'hit_legs_built': 0,
     'hit_legs_passed_73': 0,
     'hr_legs_built': 0,
     'hr_legs_passed_73': 0,
     'total_games_in_slate': len(ml_results_sorted),
-    'ready_games': sum(1 for _r in ml_results_sorted if _r['is_ready']),
+    'ready_games': sum(1 for _r in ml_results_sorted if _r.get('recommendation_ready', False)),
 }
 
 # The alternate-margin (Kalshi) and player-prop lookups below are PER-EVENT
@@ -4292,6 +4387,45 @@ if _event_ids_needing_props or _event_ids_needing_alt_spreads:
                 pass  # results discarded -- this call's only job is to populate the shared cache
 
 master_legs = []
+bet_board_legs = []
+
+def add_bet_board_leg(r, leg, bet_type, model_name):
+    """Add every real, playable market line to the slate table.
+
+    Rows are never silently discarded: strong value is PLAY, smaller positive
+    value is LEAN, incomplete pregame information is WAIT, and negative value
+    is PASS. Only PLAY rows enter the automatic parlay pool.
+    """
+    if not leg or not leg.get('has_market', True) or leg.get('market_prob') is None:
+        return
+    edge_pp = (leg['model_prob'] - leg['market_prob']) * 100.0
+    stage = r.get('prediction_stage', '—')
+    if not r.get('recommendation_ready', False):
+        rating = "WAIT"
+    else:
+        probability_floor = 0.58 if bet_type == 'Moneyline' else 0.60
+        if leg['model_prob'] >= probability_floor and edge_pp >= min_edge_threshold:
+            rating = "PLAY"
+        elif edge_pp > 0:
+            rating = "LEAN"
+        else:
+            rating = "PASS"
+    bet_board_legs.append({
+        'rating': rating,
+        'time': r['time_ct'],
+        'game': r['game'],
+        'bet_type': bet_type,
+        'desc': leg['desc'],
+        'model_name': model_name,
+        'model_prob': leg['model_prob'],
+        'market_prob': leg['market_prob'],
+        'edge': edge_pp,
+        'odds_str': leg['odds_str'],
+        'source_book': leg['source_book'],
+        'stage': stage,
+    })
+    return rating
+
 track_conn = get_track_db()
 for r in ml_results_sorted:
     if not r['is_ready']:
@@ -4304,8 +4438,8 @@ for r in ml_results_sorted:
         # the time a game has ended).
         continue
 
-    if r['has_ml_market'] and r['model_prob'] >= 0.58:
-        master_legs.append({
+    if r['has_ml_market']:
+        ml_board_leg = {
             'desc': f"{r['pick']} Moneyline ({r['market_odds_str']})",
             'model_prob': r['model_prob'],
             'market_prob': r['implied_prob'],
@@ -4313,13 +4447,19 @@ for r in ml_results_sorted:
             'decimal_odds': american_to_decimal(r['market_odds']),
             'source_book': r['source_book'],
             'game': r['game'],
-            'type': 'ml'
-        })
-        _ = log_leg_for_tracking(
-            track_conn, r['game_pk'], r['game_date'], 'ml', r['pick'],
-            f"{r['pick']} Moneyline ({r['market_odds_str']})",
-            r['model_prob'], r['implied_prob'], r['market_odds_str'], r['source_book']
+            'type': 'ml',
+            'has_market': True,
+        }
+        ml_rating = add_bet_board_leg(
+            r, ml_board_leg, 'Moneyline', '5-model calibrated ensemble'
         )
+        if ml_rating == 'PLAY':
+            master_legs.append(ml_board_leg)
+            _ = log_leg_for_tracking(
+                track_conn, r['game_pk'], r['game_date'], 'ml', r['pick'],
+                f"{r['pick']} Moneyline ({r['market_odds_str']})",
+                r['model_prob'], r['implied_prob'], r['market_odds_str'], r['source_book']
+            )
 
     if kalshi_mode and strict_kalshi:
         # Kalshi's actual product for margin-of-victory: a ladder of separate
@@ -4332,7 +4472,8 @@ for r in ml_results_sorted:
                 effective_odds_api_key, r['market_entry']['event_id'], chosen_bm_key, strict=True
             )
             for leg in build_alt_spread_legs(r, r['away_exp_runs'], r['home_exp_runs'], alt_spreads, r['game']):
-                if leg['model_prob'] >= 0.73:
+                leg_rating = add_bet_board_leg(r, leg, 'Run Line', 'Skellam run-margin model')
+                if leg_rating == 'PLAY':
                     master_legs.append(leg)
                     _ = log_leg_for_tracking(
                         track_conn, r['game_pk'], r['game_date'], 'rl', leg['desc'],
@@ -4340,7 +4481,8 @@ for r in ml_results_sorted:
                     )
     elif not kalshi_mode:
         rl_leg = build_run_line_leg(r)
-        if rl_leg and rl_leg['model_prob'] >= 0.73:
+        rl_rating = add_bet_board_leg(r, rl_leg, 'Run Line', 'Ensemble-derived run-line model')
+        if rl_rating == 'PLAY':
             master_legs.append(rl_leg)
             _ = log_leg_for_tracking(
                 track_conn, r['game_pk'], r['game_date'], 'rl', rl_leg['desc'],
@@ -4350,7 +4492,8 @@ for r in ml_results_sorted:
     away_exp_r = r['away_exp_runs']
     home_exp_r = r['home_exp_runs']
     for leg in build_total_legs(r, away_exp_r, home_exp_r, is_kalshi=strict_kalshi):
-        if leg['model_prob'] >= 0.73:
+        leg_rating = add_bet_board_leg(r, leg, 'Game Total', 'Poisson runs model')
+        if leg_rating == 'PLAY':
             master_legs.append(leg)
             _ = log_leg_for_tracking(
                 track_conn, r['game_pk'], r['game_date'], 'total', leg['desc'],
@@ -4368,7 +4511,8 @@ for r in ml_results_sorted:
                 if "TBD" not in p_name:
                     for leg in build_k_prop_legs(p_name, t_name, p_stats['k_avg'], ev_props, r['game'], is_kalshi=strict_kalshi):
                         props_diag['k_legs_built'] += 1
-                        if leg['model_prob'] >= 0.73:
+                        leg_rating = add_bet_board_leg(r, leg, 'Pitcher Strikeouts', 'Pitcher-rate Poisson')
+                        if leg_rating == 'PLAY':
                             props_diag['k_legs_passed_73'] += 1
                             master_legs.append(leg)
                             _ = log_leg_for_tracking(
@@ -4378,7 +4522,8 @@ for r in ml_results_sorted:
             for h_dict, t_name in [(r['away_hitter'], r['away_team']), (r['home_hitter'], r['home_team'])]:
                 for leg in build_hit_prop_legs(h_dict['name'], t_name, h_dict['ba'], ev_props, r['game'], is_kalshi=strict_kalshi):
                     props_diag['hit_legs_built'] += 1
-                    if leg['model_prob'] >= 0.73:
+                    leg_rating = add_bet_board_leg(r, leg, 'Batter Hits', 'Batter-rate Poisson')
+                    if leg_rating == 'PLAY':
                         props_diag['hit_legs_passed_73'] += 1
                         master_legs.append(leg)
                         _ = log_leg_for_tracking(
@@ -4387,7 +4532,8 @@ for r in ml_results_sorted:
                         )
                 for leg in build_hr_prop_legs(h_dict['name'], t_name, h_dict.get('hr_per_game'), ev_props, r['game'], is_kalshi=strict_kalshi):
                     props_diag['hr_legs_built'] += 1
-                    if leg['model_prob'] >= 0.73:
+                    leg_rating = add_bet_board_leg(r, leg, 'Batter Home Run', 'HR-rate Poisson')
+                    if leg_rating == 'PLAY':
                         props_diag['hr_legs_passed_73'] += 1
                         master_legs.append(leg)
                         _ = log_leg_for_tracking(
@@ -4404,6 +4550,55 @@ try:
     track_conn.close()
 except sqlite3.OperationalError:
     pass
+
+# Full-slate bet table: this was previously hidden across the one-game
+# selector and parlay internals. Every row below has a real posted price.
+st.markdown("### 🎟️ Today's Playable Bet Board")
+st.caption(
+    "PLAY clears your probability and edge settings; LEAN has positive model edge but misses one strong-play "
+    "threshold; WAIT is an early projection awaiting starters/lineups; PASS means the current price offers no "
+    "positive model edge. Moneylines use the calibrated five-model ensemble. Run lines, totals, and player "
+    "props use the named supporting distribution model shown in the table."
+)
+
+_rating_order = {'PLAY': 0, 'LEAN': 1, 'WAIT': 2, 'PASS': 3}
+bet_board_legs.sort(key=lambda row: (_rating_order.get(row['rating'], 9), -row['edge']))
+
+def bet_board_frame(rows):
+    icons = {'PLAY': '✅ PLAY', 'LEAN': '🟢 LEAN', 'WAIT': '🟡 WAIT', 'PASS': '⚪ PASS'}
+    return pd.DataFrame([{
+        'Rating': icons.get(row['rating'], row['rating']),
+        'Time (CT)': row['time'],
+        'Matchup': row['game'],
+        'Bet Type': row['bet_type'],
+        'Model Pick / Bet': row['desc'],
+        'Model Used': row['model_name'],
+        'Model Prob': f"{row['model_prob']*100:.1f}%",
+        'Market Prob': f"{row['market_prob']*100:.1f}%",
+        'Edge': f"{row['edge']:+.1f}pp",
+        'Odds': row['odds_str'],
+        'Book': row['source_book'],
+        'Prediction Stage': row['stage'],
+    } for row in rows])
+
+_recommended_rows = [row for row in bet_board_legs if row['rating'] in ('PLAY', 'LEAN')]
+_play_rows = [row for row in bet_board_legs if row['rating'] == 'PLAY']
+board_tab1, board_tab2 = st.tabs([
+    f"✅ Recommended ({len(_recommended_rows)})",
+    f"📋 All Real Market Bets ({len(bet_board_legs)})",
+])
+with board_tab1:
+    if _recommended_rows:
+        st.dataframe(bet_board_frame(_recommended_rows), use_container_width=True, hide_index=True)
+        st.caption(f"Strong PLAY selections: {len(_play_rows)}. LEAN rows are informational and are not added to automatic parlays.")
+    else:
+        st.info("No current real-price bets have positive model value. Open the All Real Market Bets tab to see WAIT/PASS rows instead of an empty screen.")
+with board_tab2:
+    if bet_board_legs:
+        st.dataframe(bet_board_frame(bet_board_legs), use_container_width=True, hide_index=True)
+    else:
+        st.warning("The selected sportsbook has not returned any real moneyline, run-line, total, or enabled prop prices for this slate yet.")
+
 with st.spinner("Syncing track record (settling recent results)..."):
     _ = run_track_record_maintenance()
 
@@ -4412,16 +4607,12 @@ with st.expander("🔍 Player Props Diagnostic (why strikeout/hit/HR legs may be
     _total = props_diag['total_games_in_slate']
     if _total > 0 and _ready < _total:
         st.write(
-            f"⚠️ **Only {_ready} of {_total} games today have announced starting pitchers "
-            f"('Strict Pitcher Announcement Gate' is ON).** The other {_total - _ready} game(s) are "
-            f"skipped entirely right now -- no moneyline, no totals, no props -- because MLB hasn't "
-            f"confirmed their pitchers yet. This is very often WHY parlays feel repetitive or limited "
-            f"to just a couple of games: there may simply be nothing else eligible yet. This naturally "
-            f"opens up as pitchers get announced closer to game time (usually within 12-24 hours of "
-            f"first pitch)."
+            f"⚠️ **Only {_ready} of {_total} games are bet-ready right now.** The other {_total - _ready} "
+            f"game(s) remain visible as WAIT rows in the bet board, but are excluded from automatic parlays "
+            f"until the required starter/lineup stage is reached."
         )
     else:
-        st.write(f"✅ All {_total} game(s) today have announced pitchers -- nothing is being skipped for that reason.")
+        st.write(f"✅ All {_total} game(s) are currently bet-ready -- nothing is being excluded from the parlay pool for staging reasons.")
 
     if not include_props_in_parlay:
         st.write(
@@ -4447,9 +4638,9 @@ with st.expander("🔍 Player Props Diagnostic (why strikeout/hit/HR legs may be
                     "try again closer to game time."
                 )
             else:
-                st.write(f"Strikeout legs built (book had a line + name matched): **{props_diag['k_legs_built']}** -- of those, cleared the 73% model-prob bar: **{props_diag['k_legs_passed_73']}**")
-                st.write(f"Hit legs built (book had a line + name matched): **{props_diag['hit_legs_built']}** -- of those, cleared the 73% model-prob bar: **{props_diag['hit_legs_passed_73']}**")
-                st.write(f"HR legs built (book had a line + name matched): **{props_diag['hr_legs_built']}** -- of those, cleared the 73% model-prob bar: **{props_diag['hr_legs_passed_73']}**")
+                st.write(f"Strikeout legs built (book had a line + name matched): **{props_diag['k_legs_built']}** -- PLAY rows: **{props_diag['k_legs_passed_73']}**")
+                st.write(f"Hit legs built (book had a line + name matched): **{props_diag['hit_legs_built']}** -- PLAY rows: **{props_diag['hit_legs_passed_73']}**")
+                st.write(f"HR legs built (book had a line + name matched): **{props_diag['hr_legs_built']}** -- PLAY rows: **{props_diag['hr_legs_passed_73']}**")
                 if props_diag['k_legs_built'] == 0 and props_diag['hit_legs_built'] == 0 and props_diag['hr_legs_built'] == 0:
                     st.write(
                         "⚠️ Books returned prop data, but none of it matched a pitcher/hitter name in "
@@ -4458,9 +4649,8 @@ with st.expander("🔍 Player Props Diagnostic (why strikeout/hit/HR legs may be
                     )
                 elif props_diag['k_legs_passed_73'] == 0 and props_diag['hit_legs_passed_73'] == 0 and props_diag['hr_legs_passed_73'] == 0:
                     st.write(
-                        "ℹ️ Legs exist, but none of today's pitchers/hitters clear the 73% model-confidence "
-                        "bar -- this is expected on some days (73% is a strict bar, especially for HR props "
-                        "which are naturally lower-probability) rather than a bug."
+                        "ℹ️ Prop lines exist, but none currently clear both the 60% probability floor and "
+                        "your minimum edge setting. They remain visible as LEAN/PASS rows in the bet board."
                     )
 
 ml_pool = [leg for leg in master_legs if leg['type'] in ('ml', 'rl')]
@@ -4479,7 +4669,7 @@ def build_constrained_parlay(ml_pool, prop_pool, min_payout, max_payout, max_leg
         # count -- e.g. 0.30 for a 2-leg combo AND for a 6-leg combo. That's
         # not just strict, it's arithmetically almost impossible past 2 legs:
         # multiplying together several legs that are each individually near
-        # their own minimum bar (58% for moneylines, 73% for props) sinks
+        # their own minimum bar (58% for moneylines, 60% for supporting bets) sinks
         # below a flat 0.30 by 3 legs and keeps falling from there, so every
         # High-Value parlay search was structurally forced down to 2 legs no
         # matter how many were requested. Anchoring the floor at 2 legs (so
