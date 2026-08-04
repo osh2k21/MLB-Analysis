@@ -10,8 +10,10 @@ import re
 import unicodedata
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -1334,6 +1336,47 @@ def _prediction_stage(game):
     return "Early team model", False
 
 
+# -----------------------------------------------------------------------------
+# PREGAME PREDICTION LOCK
+# -----------------------------------------------------------------------------
+# Once a game is inside its final hour before first pitch, freeze whatever
+# prediction is currently showing rather than letting it keep recomputing off
+# late-arriving data. This is deliberately a plain local JSON file (not
+# st.cache_data) so the lock survives cache expiry/app restarts for the rest
+# of that game's pregame window and Live state.
+_PREDICTION_LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "locked_predictions.json")
+_prediction_lock_mutex = threading.Lock()
+
+def _load_locked_predictions():
+    try:
+        with open(_PREDICTION_LOCK_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def _get_locked_prediction(game_pk):
+    if game_pk is None:
+        return None
+    entry = _load_locked_predictions().get(str(game_pk))
+    return entry["result"] if entry else None
+
+def _save_locked_prediction(game_pk, result):
+    if game_pk is None:
+        return
+    with _prediction_lock_mutex:
+        data = _load_locked_predictions()
+        now = datetime.now(timezone.utc)
+        data[str(game_pk)] = {"result": result, "locked_at": now.isoformat()}
+        # Prune entries older than 3 days so this file doesn't grow forever over a season.
+        data = {
+            key: entry for key, entry in data.items()
+            if (now - datetime.fromisoformat(entry.get("locked_at", now.isoformat()))) <= timedelta(days=3)
+        }
+        os.makedirs(os.path.dirname(_PREDICTION_LOCK_PATH), exist_ok=True)
+        with open(_PREDICTION_LOCK_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def run_free_ensemble(game):
     """Use every currently available free feature without withholding games.
@@ -1341,7 +1384,14 @@ def run_free_ensemble(game):
     Missing starters and lineups are normal earlier in the day. The fitted
     model supports missing values, so the UI shows a labeled preliminary
     projection and upgrades it when starters and lineups arrive.
+
+    Once a game enters its final pregame hour, the prediction locks (see
+    _get_locked_prediction/_save_locked_prediction above) and stops changing.
     """
+    locked = _get_locked_prediction(game.get('game_pk'))
+    if locked is not None:
+        return locked
+
     mlb, weather_client, bundle = get_free_ensemble_services()
     ref = _free_game_ref(game)
     stage, recommendation_ready = _prediction_stage(game)
@@ -1385,7 +1435,7 @@ def run_free_ensemble(game):
         recommendation_ready = False
 
     prediction = bundle.predict([snapshot.ordered(bundle.feature_names)])[0]
-    return {
+    result = {
         'home_probability': max(0.20, min(0.80, float(prediction.home_probability))),
         'raw_home_probability': float(prediction.raw_home_probability),
         'coverage': float(coverage),
@@ -1397,6 +1447,9 @@ def run_free_ensemble(game):
             for vote in prediction.votes
         ],
     }
+    if datetime.now(timezone.utc) >= ref.commence_time - timedelta(hours=1):
+        _save_locked_prediction(game.get('game_pk'), result)
+    return result
 
 # -----------------------------------------------------------------------------
 # ODDS MATH HELPERS
