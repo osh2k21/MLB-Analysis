@@ -1262,6 +1262,9 @@ def fetch_mlb_schedule(date_str):
                     'home_pitcher': home_pitcher_name,
                     'away_pitcher_id': g['teams']['away'].get('probablePitcher', {}).get('id'),
                     'home_pitcher_id': g['teams']['home'].get('probablePitcher', {}).get('id'),
+                    'away_pitcher_source': 'MLB Stats API' if 'TBD' not in away_pitcher_name else None,
+                    'home_pitcher_source': 'MLB Stats API' if 'TBD' not in home_pitcher_name else None,
+                    'odds_pitcher_fallback': False,
                     'away_lineup': away_lineup,
                     'home_lineup': home_lineup,
                     'venue': g.get('venue', {}).get('name', 'Standard Ballpark'),
@@ -1325,7 +1328,9 @@ def _prediction_stage(game):
     if len(game.get('away_lineup') or []) >= 9 and len(game.get('home_lineup') or []) >= 9:
         return "Confirmed lineups", True
     if game.get('pitchers_announced'):
-        return "Probable starters", True
+        return "MLB probable starters", True
+    if game.get('pitchers_available') and game.get('odds_pitcher_fallback'):
+        return "Sportsbook-listed starters (provisional)", True
     return "Early team model", False
 
 
@@ -1648,6 +1653,138 @@ def fetch_event_player_props(api_key, event_id, preferred_key, strict=False):
 
     return props
 
+
+@st.cache_data(ttl=600)
+def fetch_event_odds_pitcher_names(api_key, event_id, preferred_key, strict=False):
+    """Return sportsbook-listed pitcher names using only one prop market.
+
+    This lightweight call is used solely when MLB still lists a starter as
+    TBD. Requesting only pitcher_strikeouts conserves Odds API credits versus
+    loading every player-prop market. Results are provisional, never treated
+    as an official MLB confirmation.
+    """
+    if not api_key or not event_id:
+        return {'names': [], 'source_book': None}
+    url = (
+        "https://api.the-odds-api.com/v4/sports/baseball_mlb/events/"
+        f"{event_id}/odds?apiKey={api_key}&regions=us&markets=pitcher_strikeouts&oddsFormat=american"
+    )
+    try:
+        res = requests.get(url, timeout=8)
+        if res.status_code != 200:
+            return {'names': [], 'source_book': None}
+        data = res.json()
+    except Exception:
+        return {'names': [], 'source_book': None}
+    market, book, _ = _find_market(
+        data.get('bookmakers', []), preferred_key, 'pitcher_strikeouts', strict=strict
+    )
+    if not market:
+        return {'names': [], 'source_book': None}
+    names = {}
+    for outcome in market.get('outcomes', []):
+        display_name = outcome.get('description')
+        normalized = normalize_player_name(display_name)
+        if normalized:
+            names.setdefault(normalized, display_name)
+    return {
+        'names': [{'normalized': key, 'name': value} for key, value in names.items()],
+        'source_book': book,
+    }
+
+
+@st.cache_data(ttl=21600)
+def fetch_mlb_pitcher_directory(season):
+    """One official MLB call mapping active pitcher names to IDs and teams."""
+    url = f"https://statsapi.mlb.com/api/v1/sports/1/players?season={season}&gameType=R"
+    try:
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        people = response.json().get('people', [])
+    except Exception:
+        return []
+    return [
+        {
+            'id': person.get('id'),
+            'name': person.get('fullName'),
+            'normalized': normalize_player_name(person.get('fullName')),
+            'team_id': person.get('currentTeam', {}).get('id'),
+        }
+        for person in people
+        if person.get('id') and person.get('fullName')
+        and person.get('primaryPosition', {}).get('abbreviation') == 'P'
+    ]
+
+
+def apply_odds_pitcher_fallback(games, market_map, api_key, preferred_key, strict, season, enabled=True):
+    """Fill MLB TBD starters from sportsbook K markets when unambiguous.
+
+    The sportsbook name must map to exactly one active MLB pitcher on the
+    matching team. MLB-provided starters always win and are never replaced.
+    """
+    if not enabled or not api_key or not market_map:
+        return 0
+    directory = fetch_mlb_pitcher_directory(season)
+    if not directory:
+        return 0
+
+    def match_pitcher(odds_name, team_id):
+        normalized = odds_name.get('normalized', '')
+        exact = [p for p in directory if p['team_id'] == team_id and p['normalized'] == normalized]
+        if len(exact) == 1:
+            return exact[0]
+        # Some books abbreviate first names. Accept that only when the team,
+        # last name, and first initial resolve to one unique active pitcher.
+        tokens = normalized.split()
+        if len(tokens) < 2:
+            return None
+        fuzzy = []
+        for player in directory:
+            player_tokens = player['normalized'].split()
+            if (player['team_id'] == team_id and len(player_tokens) >= 2
+                    and player_tokens[-1] == tokens[-1]
+                    and player_tokens[0][:1] == tokens[0][:1]):
+                fuzzy.append(player)
+        return fuzzy[0] if len(fuzzy) == 1 else None
+
+    updated = 0
+    for game in games:
+        missing_sides = [
+            side for side in ('away', 'home')
+            if not game.get(f'{side}_pitcher_id') or 'TBD' in game.get(f'{side}_pitcher', 'TBD')
+        ]
+        if not missing_sides:
+            continue
+        pair = f"{game['away_team']}@{game['home_team']}"
+        entry = market_map.get(f"{game.get('game_date')}:{pair}") or market_map.get(pair)
+        if not entry or not entry.get('event_id'):
+            continue
+        odds_pitchers = fetch_event_odds_pitcher_names(
+            api_key, entry['event_id'], preferred_key, strict=strict
+        )
+        if not odds_pitchers.get('names'):
+            continue
+        used_ids = {game.get('away_pitcher_id'), game.get('home_pitcher_id')} - {None}
+        for side in missing_sides:
+            team_id = game.get(f'{side}_team_id')
+            matches = []
+            for odds_name in odds_pitchers['names']:
+                player = match_pitcher(odds_name, team_id)
+                if player and player['id'] not in used_ids:
+                    matches.append((player, odds_name['name']))
+            unique = {player['id']: (player, display) for player, display in matches}
+            if len(unique) != 1:
+                continue
+            player, display_name = next(iter(unique.values()))
+            game[f'{side}_pitcher_id'] = player['id']
+            game[f'{side}_pitcher'] = player['name'] or display_name
+            game[f'{side}_pitcher_source'] = f"The Odds API ({odds_pitchers['source_book']}) — provisional"
+            game['odds_pitcher_fallback'] = True
+            used_ids.add(player['id'])
+            updated += 1
+        game['pitchers_available'] = bool(game.get('away_pitcher_id') and game.get('home_pitcher_id'))
+    return updated
+
 @st.cache_data(ttl=600)
 def fetch_event_alternate_spreads(api_key, event_id, preferred_key, strict=False):
     """Pulls REAL alternate run-margin lines (e.g. -1.5, -2.5, -3.5, ...) for
@@ -1901,6 +2038,9 @@ def model_moneyline_game(game, market_map, min_edge, min_prob, strict_lineup_mod
         'away_pitcher': game['away_pitcher'],
         'home_pitcher_id': game.get('home_pitcher_id'),
         'away_pitcher_id': game.get('away_pitcher_id'),
+        'home_pitcher_source': game.get('home_pitcher_source'),
+        'away_pitcher_source': game.get('away_pitcher_source'),
+        'odds_pitcher_fallback': bool(game.get('odds_pitcher_fallback')),
         'home_stats': home_stats,
         'away_stats': away_stats,
         'home_hitter': home_hitter,
@@ -2542,6 +2682,11 @@ def in_prediction_lock_window(r):
     pitcher/team stats, etc. can all still move the number, which is
     useful this far out) -- only once the window is entered does
     apply_locked_ml_prediction start freezing it."""
+    # Sportsbook-listed starters are useful early but can change late. Do not
+    # freeze a provisional-pitcher forecast before MLB confirms it; this lets
+    # the next 10-second schedule refresh rebuild the model on a replacement.
+    if r.get('odds_pitcher_fallback') and r.get('abstract_state') not in ('Live', 'Final'):
+        return False
     if r.get('abstract_state') in ('Live', 'Final'):
         return True
     dt_str = r.get('game_datetime_utc')
@@ -3249,6 +3394,15 @@ kalshi_mode = True
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🎲 Player Props (Optional)")
+use_odds_pitcher_fallback = st.sidebar.toggle(
+    "Use sportsbook pitcher fallback when MLB shows TBD",
+    value=True,
+    help=(
+        "Uses one pitcher-strikeout market request only for each TBD game. "
+        "The name must map unambiguously to an active MLB pitcher on that team. "
+        "MLB remains authoritative and replaces the provisional name when updated."
+    ),
+)
 include_props = st.sidebar.toggle(
     "Show real pitcher K / batter hit / batter HR prop lines for the selected matchup",
     value=False,
@@ -3264,6 +3418,21 @@ if include_props:
 
 games = fetch_mlb_schedule(date_str)
 market_map, market_odds_diagnostic = fetch_bulk_market_odds(effective_odds_api_key, chosen_bm_key, strict=strict_kalshi)
+
+_odds_pitcher_updates = apply_odds_pitcher_fallback(
+    games,
+    market_map,
+    effective_odds_api_key,
+    chosen_bm_key,
+    strict_kalshi,
+    date_str.split('-')[0],
+    enabled=use_odds_pitcher_fallback and enable_odds_api,
+)
+if _odds_pitcher_updates:
+    st.info(
+        f"ℹ️ Filled {_odds_pitcher_updates} TBD starter slot(s) from real sportsbook pitcher-strikeout "
+        "markets. They are marked provisional and will be replaced automatically when MLB confirms a change."
+    )
 
 if not enable_odds_api:
     st.info(
@@ -3430,9 +3599,11 @@ final_games = [r for r in ml_results_sorted if r['abstract_state'] == 'Final']
 for r in ml_results_sorted:
     if not r['is_ready'] or not r.get('game_pk'):
         continue
-    if "TBD" not in r['away_pitcher']:
+    away_source_confirmed = r.get('away_pitcher_source') == 'MLB Stats API' or r.get('abstract_state') in ('Live', 'Final')
+    home_source_confirmed = r.get('home_pitcher_source') == 'MLB Stats API' or r.get('abstract_state') in ('Live', 'Final')
+    if "TBD" not in r['away_pitcher'] and away_source_confirmed:
         _ = log_pitcher_start(_pred_conn, r['game_pk'], r['game_date'], r['away_pitcher'], r['away_team'], r['home_team'], r['away_stats']['k_avg'])
-    if "TBD" not in r['home_pitcher']:
+    if "TBD" not in r['home_pitcher'] and home_source_confirmed:
         _ = log_pitcher_start(_pred_conn, r['game_pk'], r['game_date'], r['home_pitcher'], r['home_team'], r['away_team'], r['home_stats']['k_avg'])
     try:
         _pred_conn.commit()
@@ -3617,6 +3788,15 @@ def render_live_scores_section(current_date, current_market_map, min_edge, min_p
     current_ops_leaders_map = get_league_ops_leaders(current_season)
 
     current_games = fetch_mlb_schedule(current_date)
+    apply_odds_pitcher_fallback(
+        current_games,
+        current_market_map,
+        effective_odds_api_key,
+        chosen_bm_key,
+        strict_kalshi,
+        current_season,
+        enabled=use_odds_pitcher_fallback and enable_odds_api,
+    )
     current_ml_results = [model_moneyline_game(g, current_market_map, min_edge, min_prob, strict_mode, current_season, current_standings_map, current_ops_leaders_map) for g in current_games]
     # Same lock as the main slate list -- without it, this ticker (which
     # reruns every 15 seconds on its own, no click needed) is exactly where
@@ -3793,6 +3973,10 @@ for idx, r in enumerate(non_final_results, 1):
         "Time (CT)": r['time_ct'],
         "Matchup": f"{r['game']}{dh_tag}",
         "Starting Pitchers": f"Away: {r['away_pitcher']} vs Home: {r['home_pitcher']}",
+        "Pitcher Sources": (
+            f"Away: {r.get('away_pitcher_source') or 'Unavailable'} | "
+            f"Home: {r.get('home_pitcher_source') or 'Unavailable'}"
+        ),
         "Prediction Stage": r.get('prediction_stage', '—'),
         "Free Feature Coverage": f"{r.get('feature_coverage', 0)*100:.1f}%",
         "Score / State": score_display_full,
