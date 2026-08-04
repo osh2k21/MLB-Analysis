@@ -5,15 +5,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from mlb_predictor.api.injuries import InjuryClient
 from mlb_predictor.calibration import IdentityCalibrator
 from mlb_predictor.contracts import DataStatus, Evidence, GameRef
 from mlb_predictor.features import FEATURE_NAMES, FeatureEngine, FeatureError
 from mlb_predictor.features.market import american_implied, engineer_market
+from mlb_predictor.features.parks import park_run_factor
 from mlb_predictor.features.weather import air_density_kg_m3
 from mlb_predictor.models.ensemble import EnsembleBundle
 from mlb_predictor.database import PredictionRepository
 from mlb_predictor.pipeline import PredictionPipeline
 from mlb_predictor.validation import GameValidator
+from mlb_predictor.validation.validator import ValidationCheck, ValidationReport
 
 
 class ConstantModel:
@@ -93,6 +96,81 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(len(repository.settled()), 0)
             with repository.connection() as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0], 1)
+
+
+class FakeHttpResult:
+    def __init__(self, data):
+        self.data = data
+
+
+class FakeTransactionsHttp:
+    def __init__(self, transactions):
+        self.transactions = transactions
+
+    def get_json(self, url, params=None, *, ttl_seconds, validator=None):
+        return FakeHttpResult({"transactions": self.transactions})
+
+
+class InjuryClientTests(unittest.TestCase):
+    def test_active_il_placement_without_activation(self):
+        http = FakeTransactionsHttp([
+            {"date": "2026-07-01", "person": {"id": 1, "fullName": "A"},
+             "description": "New York Yankees placed RF A on the 10-day injured list."},
+        ])
+        active = InjuryClient(http)._team_active_il(147)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["player_id"], 1)
+
+    def test_activation_clears_the_placement(self):
+        http = FakeTransactionsHttp([
+            {"date": "2026-07-01", "person": {"id": 1, "fullName": "A"},
+             "description": "New York Yankees placed RF A on the 10-day injured list."},
+            {"date": "2026-07-15", "person": {"id": 1, "fullName": "A"},
+             "description": "New York Yankees activated RF A from the 10-day injured list."},
+        ])
+        active = InjuryClient(http)._team_active_il(147)
+        self.assertEqual(active, [])
+
+    def test_fetch_returns_home_and_away_evidence(self):
+        http = FakeTransactionsHttp([])
+        evidence = InjuryClient(http).fetch(147, 111)
+        self.assertEqual(evidence.status, DataStatus.OK)
+        self.assertEqual(evidence.payload, {"home": [], "away": []})
+
+
+class ParkFactorTests(unittest.TestCase):
+    def test_unmapped_venue_is_neutral(self):
+        self.assertEqual(park_run_factor("Some New Venue", {"NYC21": 1.2}), 1.0)
+
+    def test_no_history_for_mapped_venue_is_neutral(self):
+        self.assertEqual(park_run_factor("Yankee Stadium", {}), 1.0)
+
+    def test_mapped_venue_returns_trained_factor(self):
+        self.assertAlmostEqual(park_run_factor("Yankee Stadium", {"NYC21": 0.979}), 0.979)
+
+    def test_sponsor_prefix_still_resolves(self):
+        self.assertAlmostEqual(
+            park_run_factor("UNIQLO Field at Dodger Stadium", {"LOS03": 1.009}), 1.009
+        )
+
+
+class ValidationAdvisoryTests(unittest.TestCase):
+    def test_advisory_failure_alone_does_not_block(self):
+        checks = (
+            ValidationCheck("Weather available", True, "ok", "src"),
+            ValidationCheck("Umpire assigned", False, "not yet published", "src", advisory=True),
+        )
+        report = ValidationReport(1, checks, datetime.now(timezone.utc))
+        self.assertTrue(report.ready)
+        self.assertEqual(len(report.failures), 1)
+
+    def test_non_advisory_failure_still_blocks(self):
+        checks = (
+            ValidationCheck("Weather available", False, "missing", "src"),
+            ValidationCheck("Umpire assigned", False, "not yet published", "src", advisory=True),
+        )
+        report = ValidationReport(1, checks, datetime.now(timezone.utc))
+        self.assertFalse(report.ready)
 
 
 if __name__ == "__main__":
