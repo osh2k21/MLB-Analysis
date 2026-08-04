@@ -3973,12 +3973,6 @@ for idx, r in enumerate(non_final_results, 1):
         "Time (CT)": r['time_ct'],
         "Matchup": f"{r['game']}{dh_tag}",
         "Starting Pitchers": f"Away: {r['away_pitcher']} vs Home: {r['home_pitcher']}",
-        "Pitcher Sources": (
-            f"Away: {r.get('away_pitcher_source') or 'Unavailable'} | "
-            f"Home: {r.get('home_pitcher_source') or 'Unavailable'}"
-        ),
-        "Prediction Stage": r.get('prediction_stage', '—'),
-        "Free Feature Coverage": f"{r.get('feature_coverage', 0)*100:.1f}%",
         "Score / State": score_display_full,
         "Algorithmic Pick": f"👉 {r['pick']}",
         "Model Win Prob (%)": f"{r['model_prob']*100:.1f}%",
