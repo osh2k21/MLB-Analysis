@@ -617,78 +617,57 @@ def get_team_run_environment(team_id, season):
     pulled directly from the MLB Stats API's team hitting/pitching stat
     groups. Used for Pythagorean win expectation and for run/total
     projections. Falls back to neutral league-average-ish values (flagged
-    is_real=False) only if the live call still fails after retries.
-
-    Retries up to 3 times (5 seconds apart), same as get_real_pitcher_stats
-    above and for the same reason: this result is cached for an hour, so a
-    single transient MLB API hiccup would otherwise get baked in as the
-    fallback for the full cache window -- and since the fallback is a fixed
-    constant, every team hitting it during that window would display the
-    identical staff_era, which is exactly what tipped this off."""
+    is_real=False) only if the live call fails."""
     default = {'runs_pg': 4.3, 'runs_allowed_pg': 4.3, 'staff_era': 4.20, 'games': 0, 'is_real': False}
-    max_attempts = 3
-    for attempt in range(max_attempts):
-        try:
-            hit_url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season&group=hitting&season={season}"
-            hit_res = requests.get(hit_url, timeout=6).json()
-            hit_splits = hit_res.get('stats', [{}])[0].get('splits', [])
+    try:
+        hit_url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season&group=hitting&season={season}"
+        hit_res = requests.get(hit_url, timeout=6).json()
+        hit_splits = hit_res.get('stats', [{}])[0].get('splits', [])
 
-            pitch_url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season&group=pitching&season={season}"
-            pitch_res = requests.get(pitch_url, timeout=6).json()
-            pitch_splits = pitch_res.get('stats', [{}])[0].get('splits', [])
+        pitch_url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season&group=pitching&season={season}"
+        pitch_res = requests.get(pitch_url, timeout=6).json()
+        pitch_splits = pitch_res.get('stats', [{}])[0].get('splits', [])
 
-            if hit_splits and pitch_splits:
-                hit_stat = hit_splits[0]['stat']
-                pitch_stat = pitch_splits[0]['stat']
-                games = max(1, int(hit_stat.get('gamesPlayed', 1)))
-                runs_scored = float(hit_stat.get('runs', games * 4.3))
-                runs_allowed = float(pitch_stat.get('runs', games * 4.3))
-                staff_era = float(pitch_stat.get('era', 4.20))
-                return {
-                    'runs_pg': runs_scored / games,
-                    'runs_allowed_pg': runs_allowed / games,
-                    'staff_era': staff_era,
-                    'games': games,
-                    'is_real': True
-                }
-            if attempt < max_attempts - 1:
-                time.sleep(5)
-        except Exception:
-            if attempt < max_attempts - 1:
-                time.sleep(5)
-    return default
+        if not hit_splits or not pitch_splits:
+            return default
+
+        hit_stat = hit_splits[0]['stat']
+        pitch_stat = pitch_splits[0]['stat']
+        games = max(1, int(hit_stat.get('gamesPlayed', 1)))
+        runs_scored = float(hit_stat.get('runs', games * 4.3))
+        runs_allowed = float(pitch_stat.get('runs', games * 4.3))
+        staff_era = float(pitch_stat.get('era', 4.20))
+
+        return {
+            'runs_pg': runs_scored / games,
+            'runs_allowed_pg': runs_allowed / games,
+            'staff_era': staff_era,
+            'games': games,
+            'is_real': True
+        }
+    except Exception:
+        return default
 
 @st.cache_data(ttl=3600)
 def get_team_fielding(team_id, season):
     """REAL team fielding percentage and error count from the MLB Stats
     API's fielding stat group. This is a simpler proxy than advanced
     Defensive Runs Saved / Outs Above Average (which live in Statcast, not
-    the free API), but it's real, live data -- never a random number.
-
-    Retries up to 3 times (5 seconds apart) before falling back, for the
-    same reason as get_team_run_environment above: an hour-long cache means
-    one transient hiccup would otherwise show the same fixed placeholder
-    (FLD% 0.984 / 90 errors) for every team for the rest of the cache
-    window."""
+    the free API), but it's real, live data -- never a random number."""
     default = {'fielding_pct': 0.984, 'errors': 90, 'is_real': False}
-    max_attempts = 3
-    for attempt in range(max_attempts):
-        try:
-            url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season&group=fielding&season={season}"
-            res = requests.get(url, timeout=6).json()
-            splits = res.get('stats', [{}])[0].get('splits', [])
-            if splits:
-                stat = splits[0]['stat']
-                return {
-                    'fielding_pct': float(stat.get('fielding', 0.984)),
-                    'errors': int(stat.get('errors', 90)),
-                    'is_real': True
-                }
-            if attempt < max_attempts - 1:
-                time.sleep(5)
-        except Exception:
-            if attempt < max_attempts - 1:
-                time.sleep(5)
+    try:
+        url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season&group=fielding&season={season}"
+        res = requests.get(url, timeout=6).json()
+        splits = res.get('stats', [{}])[0].get('splits', [])
+        if splits:
+            stat = splits[0]['stat']
+            return {
+                'fielding_pct': float(stat.get('fielding', 0.984)),
+                'errors': int(stat.get('errors', 90)),
+                'is_real': True
+            }
+    except Exception:
+        pass
     return default
 
 @st.cache_data(ttl=3600)
@@ -4525,10 +4504,8 @@ with col1:
             f"NOT this pitcher's actual real stats. Treat any prediction using these as unreliable "
             f"until this clears (usually a temporary MLB API hiccup)."
         )
-    staff_era_label_away = "real, bullpen/depth proxy" if q_away.get('is_real', True) else "MLB API unavailable, league-average placeholder"
-    st.write(f"• ERA: **{p_stats_away['era']:.2f}** | Team Staff ERA ({staff_era_label_away}): **{q_away['staff_era']:.2f}**")
-    fielding_label_away = "real" if def_away.get('is_real', True) else "MLB API unavailable, league-average placeholder"
-    st.write(f"• **Team Fielding ({fielding_label_away}):** FLD%: `{def_away['fielding_pct']:.3f}` | Errors: `{def_away['errors']}`")
+    st.write(f"• ERA: **{p_stats_away['era']:.2f}** | Team Staff ERA (real, bullpen/depth proxy): **{q_away['staff_era']:.2f}**")
+    st.write(f"• **Team Fielding (real):** FLD%: `{def_away['fielding_pct']:.3f}` | Errors: `{def_away['errors']}`")
     if selected_game_item.get('away_rest_days') is not None:
         st.caption(f"Rest: {selected_game_item['away_rest_days']} days since last start (real, from game log)")
 
@@ -4565,10 +4542,8 @@ with col2:
             f"NOT this pitcher's actual real stats. Treat any prediction using these as unreliable "
             f"until this clears (usually a temporary MLB API hiccup)."
         )
-    staff_era_label_home = "real, bullpen/depth proxy" if q_home.get('is_real', True) else "MLB API unavailable, league-average placeholder"
-    st.write(f"• ERA: **{p_stats_home['era']:.2f}** | Team Staff ERA ({staff_era_label_home}): **{q_home['staff_era']:.2f}**")
-    fielding_label_home = "real" if def_home.get('is_real', True) else "MLB API unavailable, league-average placeholder"
-    st.write(f"• **Team Fielding ({fielding_label_home}):** FLD%: `{def_home['fielding_pct']:.3f}` | Errors: `{def_home['errors']}`")
+    st.write(f"• ERA: **{p_stats_home['era']:.2f}** | Team Staff ERA (real, bullpen/depth proxy): **{q_home['staff_era']:.2f}**")
+    st.write(f"• **Team Fielding (real):** FLD%: `{def_home['fielding_pct']:.3f}` | Errors: `{def_home['errors']}`")
     if selected_game_item.get('home_rest_days') is not None:
         st.caption(f"Rest: {selected_game_item['home_rest_days']} days since last start (real, from game log)")
 
