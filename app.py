@@ -462,6 +462,15 @@ st.markdown("""
         display: block;
         margin: 0 2px;
     }
+
+    /* Streamlit dims/fades any element still marked "stale" while a
+       fragment is mid-rerun -- the render_live_scores_section fragment
+       below reruns every 10s, so without this override the whole live
+       scoreboard visibly darkens and un-darkens on every refresh. */
+    [data-stale="true"] {
+        opacity: 1 !important;
+        transition: none !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
