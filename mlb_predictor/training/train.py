@@ -33,10 +33,13 @@ def train_bundle(csv_path: Path, artifact_path: Path) -> tuple[EnsembleBundle, d
     frame = frame.sort_values("game_date").reset_index(drop=True)
     if len(frame) < 500:
         raise ValueError("at least 500 chronologically ordered games are required")
-    if frame[FEATURE_NAMES].isna().any().any():
-        raise ValueError("training features contain missing values; no imputation is allowed")
     if not set(frame["home_win"].unique()).issubset({0, 1}):
         raise ValueError("home_win must be 0/1")
+    coverage = frame[FEATURE_NAMES].notna().mean(axis=1)
+    core = frame[["team_elo_rating_diff", "runs_pg_season_diff"]].notna().all(axis=1)
+    frame = frame[(coverage >= 0.75) & core].reset_index(drop=True)
+    if len(frame) < 500:
+        raise ValueError("fewer than 500 rows remain after the 75% free-feature coverage requirement")
 
     train_end, calibration_end = int(len(frame) * 0.70), int(len(frame) * 0.85)
     train, calibration, test = frame.iloc[:train_end], frame.iloc[train_end:calibration_end], frame.iloc[calibration_end:]
@@ -54,7 +57,7 @@ def train_bundle(csv_path: Path, artifact_path: Path) -> tuple[EnsembleBundle, d
         estimator.fit(x_train, y_train)
         models[name] = SklearnProbabilityModel(name, estimator)
     models["elo"] = EloModel(FEATURE_NAMES.index("team_elo_rating_diff"))
-    models["poisson"] = PoissonModel(FEATURE_NAMES.index("lineup_projected_runs_diff"), FEATURE_NAMES.index("total_current"))
+    models["poisson"] = PoissonModel(FEATURE_NAMES.index("runs_pg_season_diff"))
 
     cal_rows = x_cal.values.tolist()
     component_cal = {name: model.predict_home_probability(cal_rows) for name, model in models.items()}
@@ -71,7 +74,24 @@ def train_bundle(csv_path: Path, artifact_path: Path) -> tuple[EnsembleBundle, d
     selected = min(zip(candidates, selection_probs), key=lambda pair: _brier(pair[1], y_cal.iloc[midpoint:]))[0]
     selected.fit(raw_cal, y_cal.tolist())
 
-    bundle = EnsembleBundle(models, weights, FEATURE_NAMES, selected, x_train.mean().tolist(), str(train["game_date"].max()))
+    metadata = {}
+    if {"home_team", "away_team", "site", "home_runs", "away_runs"}.issubset(frame.columns):
+        from collections import defaultdict
+        elo = defaultdict(lambda: 1500.0)
+        park_runs, park_games = defaultdict(float), defaultdict(int)
+        total_runs = total_games = 0.0
+        for record in frame.sort_values("game_date").to_dict("records"):
+            home, away, outcome = record["home_team"], record["away_team"], int(record["home_win"])
+            expected = 1 / (1 + 10 ** (-((elo[home] + 24) - elo[away]) / 400))
+            elo[home] += 20 * (outcome - expected); elo[away] += 20 * ((1 - outcome) - (1 - expected))
+            runs = float(record["home_runs"]) + float(record["away_runs"])
+            park_runs[record["site"]] += runs; park_games[record["site"]] += 1
+            total_runs += runs; total_games += 1
+        league = total_runs / total_games
+        metadata["elo_ratings"] = dict(elo)
+        metadata["park_factors"] = {site: (park_runs[site] / games) / league for site, games in park_games.items() if games >= 20}
+        metadata["league_runs_per_game"] = league
+    bundle = EnsembleBundle(models, weights, FEATURE_NAMES, selected, x_train.median().fillna(0).tolist(), str(train["game_date"].max()), metadata)
     test_predictions = bundle.predict(x_test.values.tolist())
     test_probs = [item.home_probability for item in test_predictions]
     evaluation_probabilities = [max(p, 1 - p) for p in test_probs]

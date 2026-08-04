@@ -13,13 +13,14 @@ def _poisson_pmf(k: int, rate: float) -> float:
 class PoissonModel:
     name = "poisson"
 
-    def __init__(self, run_diff_index: int, total_index: int, max_runs: int = 20) -> None:
+    def __init__(self, run_diff_index: int, total_index: int | None = None, max_runs: int = 20, league_total: float = 8.6) -> None:
         self.run_diff_index, self.total_index, self.max_runs = run_diff_index, total_index, max_runs
+        self.league_total = league_total
 
     def predict_home_probability(self, rows: Sequence[Sequence[float]]) -> list[float]:
         results = []
         for row in rows:
-            total = max(2.0, float(row[self.total_index]))
+            total = self.league_total if self.total_index is None else max(2.0, float(row[self.total_index]))
             diff = max(-total + 0.1, min(total - 0.1, float(row[self.run_diff_index])))
             home_rate, away_rate = max(0.05, (total + diff) / 2), max(0.05, (total - diff) / 2)
             home_win = tie = 0.0
@@ -33,4 +34,3 @@ class PoissonModel:
             # MLB cannot tie; split the extra-inning mass evenly absent a trained extras model.
             results.append(clamp_probability(home_win + 0.5 * tie))
         return results
-

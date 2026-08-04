@@ -4,5 +4,4 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 data/*.sqlite3
-artifacts/*.joblib
-artifacts/*.json
+# The fitted production artifact and its audit report are intentionally versioned.

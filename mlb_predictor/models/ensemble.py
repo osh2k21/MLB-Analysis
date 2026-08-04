@@ -35,6 +35,7 @@ class EnsembleBundle:
         calibrator: Any | None = None,
         feature_means: Sequence[float] | None = None,
         trained_through: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
         missing = set(self.REQUIRED_MODELS) - set(models)
         if missing:
@@ -50,6 +51,7 @@ class EnsembleBundle:
         self.calibrator = calibrator or IdentityCalibrator()
         self.feature_means = list(feature_means or [0.0] * len(feature_names))
         self.trained_through = trained_through
+        self.metadata = dict(metadata or {})
         self.created_at = datetime.now(timezone.utc).isoformat()
 
     def predict(self, rows: Sequence[Sequence[float]]) -> list[EnsemblePrediction]:
@@ -66,4 +68,3 @@ class EnsembleBundle:
             calibrated = self.calibrator.transform([raw])[0]
             output.append(EnsemblePrediction(raw, clamp_probability(calibrated), votes))
         return output
-
