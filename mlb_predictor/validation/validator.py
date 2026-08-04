@@ -14,7 +14,6 @@ class ValidationCheck:
     detail: str
     source: str
     age_seconds: float | None = None
-    advisory: bool = False
 
 
 @dataclass(frozen=True)
@@ -25,7 +24,7 @@ class ValidationReport:
 
     @property
     def ready(self) -> bool:
-        return all(item.passed for item in self.checks if not item.advisory)
+        return all(item.passed for item in self.checks)
 
     @property
     def decision(self) -> str:
@@ -83,19 +82,17 @@ class GameValidator:
         ]
 
         mapping = (
-            ("Bullpen updated", "bullpen", "bullpen_updated", lambda x: isinstance(x, dict) and bool(x.get("home")) and bool(x.get("away")), False),
-            ("Weather available", "weather", "weather_available", lambda x: isinstance(x, dict) and ("main" in x or "temperature_f" in x or "temperature_2m" in x), False),
-            ("Odds available", "odds", "odds_available", lambda x: isinstance(x, dict) and bool(x.get("home")) and bool(x.get("away")), False),
-            ("Statcast updated", "statcast", "statcast_updated", lambda x: isinstance(x, dict) and bool(x.get("home")) and bool(x.get("away")), False),
-            ("Injury feed updated", "injuries", "injury_feed_updated", lambda x: isinstance(x, dict) and "home" in x and "away" in x, False),
-            # MLB's free feed only publishes the umpire crew once a game goes live, so
-            # this can never be "ready" pregame. Track and surface it, but don't withhold on it.
-            ("Umpire assigned", "umpire", "umpire_assigned", lambda x: isinstance(x, dict) and bool(x.get("home_plate")), True),
+            ("Bullpen updated", "bullpen", "bullpen_updated", lambda x: isinstance(x, dict) and bool(x.get("home")) and bool(x.get("away"))),
+            ("Weather available", "weather", "weather_available", lambda x: isinstance(x, dict) and ("main" in x or "temperature_f" in x)),
+            ("Odds available", "odds", "odds_available", lambda x: isinstance(x, dict) and bool(x.get("home")) and bool(x.get("away"))),
+            ("Statcast updated", "statcast", "statcast_updated", lambda x: isinstance(x, dict) and bool(x.get("home")) and bool(x.get("away"))),
+            ("Injury feed updated", "injuries", "injury_feed_updated", lambda x: isinstance(x, dict) and "home" in x and "away" in x),
+            ("Umpire assigned", "umpire", "umpire_assigned", lambda x: isinstance(x, dict) and bool(x.get("home_plate"))),
         )
-        for label, key, age_key, predicate, advisory in mapping:
+        for label, key, age_key, predicate in mapping:
             item = evidence.get(key)
             ok, detail, age = self._fresh(item, self.MAX_AGES[age_key])
             if ok and not predicate(item.payload):
                 ok, detail = False, "payload missing required game fields"
-            checks.append(ValidationCheck(label, ok, detail, item.source if item else key, age, advisory))
+            checks.append(ValidationCheck(label, ok, detail, item.source if item else key, age))
         return ValidationReport(game.game_pk, tuple(checks), datetime.now(timezone.utc))

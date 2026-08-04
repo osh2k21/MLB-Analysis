@@ -18,16 +18,10 @@ from pathlib import Path
 from mlb_predictor.api import HttpClient as FreeHttpClient
 from mlb_predictor.api import MLBStatsClient as FreeMLBStatsClient
 from mlb_predictor.api import WeatherClient as FreeWeatherClient
-from mlb_predictor.api.injuries import InjuryClient
-from mlb_predictor.api.statcast import StatcastClient
-from mlb_predictor.api.umpires import UmpireClient
 from mlb_predictor.config import load_settings as load_free_settings
-from mlb_predictor.contracts import DataStatus, Evidence, GameRef as FreeGameRef, FeatureSnapshot as FreeFeatureSnapshot
-from mlb_predictor.database import PredictionRepository
-from mlb_predictor.features.catalog import BULLPEN as BULLPEN_FEATURE_NAMES
+from mlb_predictor.contracts import GameRef as FreeGameRef, FeatureSnapshot as FreeFeatureSnapshot
 from mlb_predictor.features.free_live import FreeLiveFeatureBuilder, TEAM_CODES
 from mlb_predictor.pipeline import load_bundle as load_free_bundle
-from mlb_predictor.validation import GameValidator
 
 # The parallel pre-warming used throughout this app (team/pitcher stats,
 # Kalshi prop/margin lookups, box-score settlement) runs real network calls
@@ -1308,16 +1302,10 @@ def get_free_ensemble_services():
         attempts=settings.max_attempts,
         requests_per_second=8.0,
     )
-    mlb = FreeMLBStatsClient(http)
     return (
-        mlb,
+        FreeMLBStatsClient(http),
         FreeWeatherClient(http, settings.weather_base_url),
         load_free_bundle(settings.model_path),
-        InjuryClient(http),
-        UmpireClient(),
-        StatcastClient(http, mlb),
-        GameValidator(),
-        PredictionRepository(settings.database_path),
     )
 
 
@@ -1347,20 +1335,14 @@ def _prediction_stage(game):
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def run_free_ensemble(game, _market_entry=None):
+def run_free_ensemble(game):
     """Use every currently available free feature without withholding games.
 
     Missing starters and lineups are normal earlier in the day. The fitted
     model supports missing values, so the UI shows a labeled preliminary
     projection and upgrades it when starters and lineups arrive.
-
-    Separately, real evidence (injuries, bullpen, weather, odds, Statcast,
-    umpire) is run through GameValidator's eight fail-closed gates. This does
-    not change the displayed probability -- it only tightens
-    'recommendation_ready' and gives a concrete reason when a gate is
-    unmet, instead of the single generic "early stage" label used before.
     """
-    mlb, weather_client, bundle, injury_client, umpire_client, statcast_client, validator, repository = get_free_ensemble_services()
+    mlb, weather_client, bundle = get_free_ensemble_services()
     ref = _free_game_ref(game)
     stage, recommendation_ready = _prediction_stage(game)
     feed = mlb.game_feed(ref.game_pk)
@@ -1403,57 +1385,6 @@ def run_free_ensemble(game, _market_entry=None):
         recommendation_ready = False
 
     prediction = bundle.predict([snapshot.ordered(bundle.feature_names)])[0]
-
-    # Real fail-closed gating. Gathering this evidence never changes the
-    # probability above -- it only tells the UI whether the underlying data
-    # is actually fresh and complete enough to call the projection a
-    # qualified recommendation, and if not, why.
-    validation_checks = None
-    try:
-        now = datetime.now(timezone.utc)
-        bullpen_fresh = any(
-            math.isfinite(snapshot.values.get(name, math.nan)) for name in BULLPEN_FEATURE_NAMES
-        )
-        bullpen_evidence = Evidence(
-            "MLB Stats API recent relief boxscores",
-            DataStatus.OK if bullpen_fresh else DataStatus.MISSING,
-            now,
-            {"home": {"available": True}, "away": {"available": True}} if bullpen_fresh else None,
-        )
-        market_h2h = (_market_entry or {}).get('h2h')
-        odds_evidence = Evidence(
-            "The Odds API",
-            DataStatus.OK if market_h2h else DataStatus.MISSING,
-            now,
-            {"home": {"price": market_h2h['home_odds']}, "away": {"price": market_h2h['away_odds']}} if market_h2h else None,
-        )
-        evidence = {
-            "mlb_feed": feed,
-            "bullpen": bullpen_evidence,
-            "weather": weather,
-            "odds": odds_evidence,
-            "statcast": statcast_client.fetch(ref.home_team_id, ref.away_team_id, ref.commence_time.year),
-            "injuries": injury_client.fetch(ref.home_team_id, ref.away_team_id),
-            "umpire": umpire_client.from_game_feed(feed),
-        }
-        report = validator.validate(ref, evidence)
-        repository.record_validation(ref.game_pk, report.ready, [
-            {k: v for k, v in vars(check).items()} for check in report.checks
-        ])
-        recommendation_ready = recommendation_ready and report.ready
-        validation_checks = [
-            {
-                'name': check.name, 'passed': check.passed, 'detail': check.detail,
-                'source': check.source, 'advisory': check.advisory,
-            }
-            for check in report.checks
-        ]
-    except Exception:
-        # A validation-gathering failure should never take down the
-        # displayed projection; it just means we can't tighten readiness
-        # with real fail-closed reasons this cycle.
-        pass
-
     return {
         'home_probability': max(0.20, min(0.80, float(prediction.home_probability))),
         'raw_home_probability': float(prediction.raw_home_probability),
@@ -1461,7 +1392,6 @@ def run_free_ensemble(game, _market_entry=None):
         'stage': stage,
         'recommendation_ready': recommendation_ready,
         'feature_error': feature_error,
-        'validation_checks': validation_checks,
         'votes': [
             {'model': vote.model, 'home_probability': vote.home_probability, 'weight': vote.weight}
             for vote in prediction.votes
@@ -2027,25 +1957,13 @@ def model_moneyline_game(game, market_map, min_edge, min_prob, strict_lineup_mod
     # from reflecting a genuinely lopsided real matchup.
     home_win_prob = max(0.03, min(0.97, home_win_prob))
 
-    # ---- REAL MARKET ONLY: no fallback fabrication ----
-    # Date-qualified key first -- prevents a multi-game series between the
-    # same two teams from matching the wrong date's odds. Falls back to the
-    # team-only key only if no date-qualified entry exists (e.g. the odds
-    # API's commence_time was missing for some reason). Looked up before the
-    # ensemble call so real-time market freshness can feed the fail-closed
-    # "Odds available" validation gate below.
-    dated_key = f"{game.get('game_date')}:{game['away_team']}@{game['home_team']}"
-    key = f"{game['away_team']}@{game['home_team']}"
-    market_entry = market_map.get(dated_key) or market_map.get(key)
-    has_ml_market = bool(market_entry and market_entry.get('h2h'))
-
     # The restored dashboard still computes the descriptive legacy fields
     # above because its deep-dive UI displays them. The actual moneyline
     # probability, however, comes from the fitted five-model ensemble.
     ensemble_result = None
     ensemble_error = ""
     try:
-        ensemble_result = run_free_ensemble(game, _market_entry=market_entry)
+        ensemble_result = run_free_ensemble(game)
         home_win_prob = ensemble_result['home_probability']
     except Exception as exc:
         ensemble_error = str(exc)
@@ -2058,11 +1976,6 @@ def model_moneyline_game(game, market_map, min_edge, min_prob, strict_lineup_mod
     warning_reason = "" if is_ready else f"Trained model unavailable: {ensemble_error}"
     prediction_stage = ensemble_result['stage'] if ensemble_result else "Prediction unavailable"
     recommendation_ready = bool(ensemble_result and ensemble_result['recommendation_ready'])
-    validation_checks = ensemble_result['validation_checks'] if ensemble_result else None
-    if validation_checks:
-        failed = [c['name'] for c in validation_checks if not c['passed'] and not c['advisory']]
-        if failed and not recommendation_ready:
-            warning_reason = "Prediction Withheld: " + "; ".join(failed)
     if game['abstract_state'] in ['Live', 'Final']:
         recommendation_ready = is_ready
     if not strict_lineup_mode:
@@ -2076,6 +1989,16 @@ def model_moneyline_game(game, market_map, min_edge, min_prob, strict_lineup_mod
         pick = game['away_team']
         model_prob = away_win_prob
         underdog = game['home_team']
+
+    # ---- REAL MARKET ONLY: no fallback fabrication ----
+    # Date-qualified key first -- prevents a multi-game series between the
+    # same two teams from matching the wrong date's odds. Falls back to the
+    # team-only key only if no date-qualified entry exists (e.g. the odds
+    # API's commence_time was missing for some reason).
+    dated_key = f"{game.get('game_date')}:{game['away_team']}@{game['home_team']}"
+    key = f"{game['away_team']}@{game['home_team']}"
+    market_entry = market_map.get(dated_key) or market_map.get(key)
+    has_ml_market = bool(market_entry and market_entry.get('h2h'))
 
     market_odds = None
     market_odds_str = "No Market Data"
@@ -2152,7 +2075,6 @@ def model_moneyline_game(game, market_map, min_edge, min_prob, strict_lineup_mod
         'feature_coverage': ensemble_result['coverage'] if ensemble_result else 0.0,
         'model_votes': ensemble_result['votes'] if ensemble_result else [],
         'backend_error': ensemble_result.get('feature_error', '') if ensemble_result else ensemble_error,
-        'validation_checks': validation_checks,
         'lineups_confirmed': len(game.get('away_lineup') or []) >= 9 and len(game.get('home_lineup') or []) >= 9,
         'has_ml_market': has_ml_market,
         'source_book': source_book,
@@ -4051,6 +3973,12 @@ for idx, r in enumerate(non_final_results, 1):
         "Time (CT)": r['time_ct'],
         "Matchup": f"{r['game']}{dh_tag}",
         "Starting Pitchers": f"Away: {r['away_pitcher']} vs Home: {r['home_pitcher']}",
+        "Pitcher Sources": (
+            f"Away: {r.get('away_pitcher_source') or 'Unavailable'} | "
+            f"Home: {r.get('home_pitcher_source') or 'Unavailable'}"
+        ),
+        "Prediction Stage": r.get('prediction_stage', '—'),
+        "Free Feature Coverage": f"{r.get('feature_coverage', 0)*100:.1f}%",
         "Score / State": score_display_full,
         "Algorithmic Pick": f"👉 {r['pick']}",
         "Model Win Prob (%)": f"{r['model_prob']*100:.1f}%",
@@ -4064,12 +3992,6 @@ for idx, r in enumerate(non_final_results, 1):
         "Edge (pp)": f"{r['edge']:+.1f}" if r['edge'] is not None else "—",
         "Book": r['source_book'] if r['has_ml_market'] else "—",
         "Proj. Run Diff": f"{r['projected_run_diff']:.2f}",
-        "Pitcher Sources": (
-            f"Away: {r.get('away_pitcher_source') or 'Unavailable'} | "
-            f"Home: {r.get('home_pitcher_source') or 'Unavailable'}"
-        ),
-        "Prediction Stage": r.get('prediction_stage', '—'),
-        "Free Feature Coverage": f"{r.get('feature_coverage', 0)*100:.1f}%",
     })
 
 st.dataframe(pd.DataFrame(ml_table_data_full), use_container_width=True, hide_index=True)

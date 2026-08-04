@@ -8,7 +8,6 @@ from ..api.mlb import MLBStatsClient
 from ..contracts import DataStatus, Evidence, FeatureSnapshot, GameRef
 from .catalog import FEATURE_NAMES, OFFENSE_METRICS, TEAM_PITCHING_METRICS, DEFENSE_METRICS, WINDOWS
 from .engine import FeatureError
-from .parks import park_run_factor
 from ..training.retrosheet_builder import RAW_PITCHER_COLUMNS, pitcher_rates, team_rates
 
 
@@ -197,12 +196,12 @@ class FreeLiveFeatureBuilder:
             "wind_speed_mph": _num(payload.get("wind_speed_10m"), math.nan),
             "roof_closed": float("closed" in roof_text or "dome" in roof_text),
             "day_game": float(str(feed.payload.get("gameData", {}).get("datetime", {}).get("dayNight", "")).lower() == "day") if feed.usable else math.nan,
-            "park_run_factor": park_run_factor(game.venue_name, self.metadata.get("park_factors", {})),
+            "park_run_factor": math.nan,
         })
         for name in ("temperature_f", "wind_speed_mph"):
             provenance[name] = "Open-Meteo"
         provenance["roof_closed"] = provenance["day_game"] = "MLB Stats API"
-        provenance["park_run_factor"] = "Retrosheet historical park sample (trailing training-set average)"
+        provenance["park_run_factor"] = "Retrosheet historical park sample unavailable for MLB venue mapping"
         home_rest, home_travel = self._rest_travel(game.home_team_id, game_dt, game.venue_name)
         away_rest, away_travel = self._rest_travel(game.away_team_id, game_dt, game.venue_name)
         values["rest_days_diff"] = home_rest - away_rest
