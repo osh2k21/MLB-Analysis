@@ -38,6 +38,21 @@ CONTEXT = [
     "team_elo_rating_diff", "il_pitchers_diff", "il_batters_diff",
 ]
 
+# Quality-of-contact from Baseball Savant. Deliberately no "season" window here
+# (unlike WINDOWS above) -- a season-long Statcast rolling sum can't be computed
+# cheaply at live-inference time without re-summing the whole season day by day,
+# and the live and training feature sets must stay identical.
+#
+# barrel_rate was tried and dropped: validated via retrain, it made the model
+# worse (Brier 0.24546 -> 0.24611) even though hard_hit_rate alone -- same
+# windows, same both-sides structure -- measurably improved it (-> 0.24521).
+# Barrel rate's narrower launch-angle+speed definition is noisier over these
+# short windows on a ~12k-game training set; hard-hit rate (just >=95mph exit
+# velocity) is the more stable of the two Savant metrics in practice here.
+STATCAST_METRICS = ("hard_hit_rate", "hard_hit_rate_allowed")
+STATCAST_WINDOWS = ("7d", "14d", "30d")
+STATCAST = [f"{metric}_{window}_diff" for metric in STATCAST_METRICS for window in STATCAST_WINDOWS]
+
 MARKET: list[str] = []  # post-model comparison, never a leaked training input
 
 FEATURE_CATEGORIES = {
@@ -46,11 +61,12 @@ FEATURE_CATEGORIES = {
     "lineup": OFFENSE,
     "defense": DEFENSE,
     "weather": CONTEXT,
+    "statcast": STATCAST,
     "market": MARKET,
 }
 FEATURE_NAMES = [name for names in FEATURE_CATEGORIES.values() for name in names]
-FEATURE_VERSION = "2.1.0-free"
+FEATURE_VERSION = "2.2.0-free"
 
-assert len(FEATURE_NAMES) == 122, len(FEATURE_NAMES)
+assert len(FEATURE_NAMES) == 128, len(FEATURE_NAMES)
 assert len(FEATURE_NAMES) == len(set(FEATURE_NAMES))
 

@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import math
 from typing import Any
 
 from ..api.mlb import MLBStatsClient
 from ..contracts import DataStatus, Evidence, FeatureSnapshot, GameRef
-from .catalog import FEATURE_NAMES, OFFENSE_METRICS, TEAM_PITCHING_METRICS, DEFENSE_METRICS, WINDOWS
+from .catalog import (
+    FEATURE_NAMES, OFFENSE_METRICS, TEAM_PITCHING_METRICS, DEFENSE_METRICS, WINDOWS,
+    STATCAST_METRICS, STATCAST_WINDOWS,
+)
 from .engine import FeatureError
 from ..training.retrosheet_builder import RAW_PITCHER_COLUMNS, pitcher_rates, team_rates
 from ..training.injuries import active_il_counts, parse_il_events
+from ..training.statcast import aggregate_day, statcast_rates
 
 
 TEAM_CODES = {
@@ -128,6 +133,35 @@ class FreeLiveFeatureBuilder:
         pitchers, batters = active_il_counts(events, game_date.date() + timedelta(days=1))
         return float(pitchers), float(batters)
 
+    def _fetch_statcast_day(self, day) -> tuple:
+        today = datetime.now(timezone.utc).date()
+        ttl = 7 * 24 * 3600 if day < today else 3600
+        result = self.mlb.http.get_csv(
+            "https://baseballsavant.mlb.com/statcast_search/csv",
+            {"all": "true", "hfGT": "R|", "game_date_gt": day.isoformat(), "game_date_lt": day.isoformat(), "type": "details"},
+            ttl_seconds=ttl,
+        )
+        return day, aggregate_day(result.data)
+
+    def _statcast_history(self, as_of: datetime) -> dict[str, list[tuple]]:
+        """Last 30 days of team-level barrel/hard-hit aggregates, day-fetched (not one big
+        range query) so each day gets its own cache entry through the shared HttpClient:
+        fully-completed past days are immutable and cached for a week, while today's
+        (possibly still in progress) date gets a short TTL. A full slate of games sharing
+        this same HttpClient means only the first game's build() actually re-fetches a
+        given day; the rest hit cache.
+
+        Fetched with a small thread pool -- each day is a multi-MB pitch-level CSV, and
+        30 of them sequentially takes minutes; concurrent fetches (still throttled by the
+        shared HttpClient's own rate limiter) bring a cold cache down to tens of seconds."""
+        days = [(as_of - timedelta(days=offset)).date() for offset in range(1, 31)]
+        daily: dict[str, list[tuple]] = {}
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            for day, totals in executor.map(self._fetch_statcast_day, days):
+                for code, values in totals.items():
+                    daily.setdefault(code, []).append((day, *values))
+        return daily
+
     def _rest_travel(self, team_id: int, game_date: datetime, venue_name: str) -> tuple[float, float]:
         start = (game_date - timedelta(days=7)).date().isoformat(); end = (game_date - timedelta(days=1)).date().isoformat()
         result = self.mlb.http.get_json(
@@ -229,6 +263,17 @@ class FreeLiveFeatureBuilder:
         values["il_pitchers_diff"] = home_il_pitchers - away_il_pitchers
         values["il_batters_diff"] = home_il_batters - away_il_batters
         provenance["il_pitchers_diff"] = provenance["il_batters_diff"] = "MLB Stats API transactions"
+        statcast_history = self._statcast_history(game_dt)
+        home_statcast_days = statcast_history.get(TEAM_CODES.get(game.home_team), [])
+        away_statcast_days = statcast_history.get(TEAM_CODES.get(game.away_team), [])
+        for window in STATCAST_WINDOWS:
+            window_days = int(window[:-1])
+            home_rates = statcast_rates(home_statcast_days, game_dt.date(), window_days)
+            away_rates = statcast_rates(away_statcast_days, game_dt.date(), window_days)
+            for metric in STATCAST_METRICS:
+                name = f"{metric}_{window}_diff"
+                values[name] = home_rates[metric] - away_rates[metric]
+                provenance[name] = "Baseball Savant"
         ratings = self.metadata.get("elo_ratings", {})
         values["team_elo_rating_diff"] = _num(ratings.get(TEAM_CODES.get(game.home_team)), 1500) - _num(ratings.get(TEAM_CODES.get(game.away_team)), 1500)
         provenance["team_elo_rating_diff"] = "Retrosheet historical Elo"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from mlb_predictor.models.ensemble import EnsembleBundle
 from mlb_predictor.database import PredictionRepository
 from mlb_predictor.pipeline import PredictionPipeline
 from mlb_predictor.training.injuries import active_il_counts, parse_il_events
+from mlb_predictor.training.statcast import aggregate_day, statcast_rates
 from mlb_predictor.validation import GameValidator
 
 
@@ -146,6 +148,62 @@ class InjuriesFeatureTests(unittest.TestCase):
         self.assertEqual(active_il_counts(snapshots, date(2024, 5, 10)), (0, 0))
         self.assertEqual(active_il_counts(snapshots, date(2024, 5, 9)), (0, 0))
         self.assertEqual(active_il_counts(snapshots, date(2024, 5, 11)), (0, 1))
+
+
+def _pitch(home_team, away_team, top, launch_speed=None, launch_speed_angle=None):
+    return {
+        "home_team": home_team, "away_team": away_team,
+        "inning_topbot": "Top" if top else "Bot",
+        "launch_speed": launch_speed, "launch_speed_angle": launch_speed_angle,
+    }
+
+
+class StatcastFeatureTests(unittest.TestCase):
+    def test_barrel_credited_to_batter_and_allowed_to_opposing_pitcher(self):
+        # Bot half: home team (LAA) is batting, away team (PHI) is pitching.
+        rows = [_pitch("LAA", "PHI", top=False, launch_speed="102.5", launch_speed_angle="6")]
+        totals = aggregate_day(rows)
+        self.assertEqual(totals["LAA"], (1, 1, 1, 0, 0, 0))  # batting: 1 barrel, 1 hard-hit, 1 batted ball
+        self.assertEqual(totals["PHI"], (0, 0, 0, 1, 1, 1))  # allowed: same ball counted against PHI's pitching
+
+    def test_top_half_attributes_to_away_batting(self):
+        # Top half: away team (PHI) is batting, home team (LAA) is pitching.
+        rows = [_pitch("LAA", "PHI", top=True, launch_speed="96.0", launch_speed_angle="4")]
+        totals = aggregate_day(rows)
+        self.assertEqual(totals["PHI"][:3], (0, 1, 1))  # hard-hit (>=95) but not a barrel
+        self.assertEqual(totals["LAA"][3:], (0, 1, 1))
+
+    def test_non_batted_ball_rows_are_ignored(self):
+        rows = [_pitch("LAA", "PHI", top=False, launch_speed=None)]
+        self.assertEqual(aggregate_day(rows), {})
+
+    def test_below_hard_hit_threshold_counts_as_batted_ball_only(self):
+        rows = [_pitch("LAA", "PHI", top=False, launch_speed="80.0", launch_speed_angle="2")]
+        totals = aggregate_day(rows)
+        self.assertEqual(totals["LAA"], (0, 0, 1, 0, 0, 0))
+
+    def test_unmapped_team_code_is_skipped_not_crashed(self):
+        rows = [_pitch("XXX", "PHI", top=False, launch_speed="102.5", launch_speed_angle="6")]
+        self.assertEqual(aggregate_day(rows), {})
+
+    def test_statcast_rates_windows_and_nan_on_no_data(self):
+        daily_rows = [
+            (date(2024, 5, 1), 2, 3, 5, 1, 2, 4),  # barrels, hard_hits, bb, barrels_allowed, hh_allowed, bb_allowed
+            (date(2024, 5, 10), 0, 0, 3, 0, 0, 2),
+        ]
+        # 7-day window from 2024-05-15 only reaches back to 2024-05-08, so only the 05-10 row counts.
+        rates = statcast_rates(daily_rows, date(2024, 5, 15), 7)
+        self.assertEqual(rates["barrel_rate"], 0 / 3)
+        self.assertEqual(rates["barrel_rate_allowed"], 0 / 2)
+        # 30-day window picks up both rows.
+        rates_30 = statcast_rates(daily_rows, date(2024, 5, 15), 30)
+        self.assertAlmostEqual(rates_30["barrel_rate"], 2 / 8)
+        self.assertAlmostEqual(rates_30["hard_hit_rate_allowed"], 2 / 6)
+
+    def test_statcast_rates_nan_with_zero_batted_balls_in_window(self):
+        rates = statcast_rates([], date(2024, 5, 15), 7)
+        self.assertTrue(math.isnan(rates["barrel_rate"]))
+        self.assertTrue(math.isnan(rates["hard_hit_rate_allowed"]))
 
 
 if __name__ == "__main__":

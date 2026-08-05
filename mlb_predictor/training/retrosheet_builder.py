@@ -8,8 +8,12 @@ import math
 from typing import Iterable
 import zipfile
 
-from ..features.catalog import FEATURE_NAMES, OFFENSE_METRICS, TEAM_PITCHING_METRICS, DEFENSE_METRICS, WINDOWS
+from ..features.catalog import (
+    FEATURE_NAMES, OFFENSE_METRICS, TEAM_PITCHING_METRICS, DEFENSE_METRICS, WINDOWS,
+    STATCAST_METRICS, STATCAST_WINDOWS,
+)
 from .injuries import active_il_counts, fetch_il_timelines
+from .statcast import fetch_statcast_daily_aggregates, statcast_rates
 
 
 RAW_TEAM_COLUMNS = (
@@ -162,6 +166,7 @@ def build_training_frame(season_dirs: Iterable[Path]):
     last_game: dict[str, tuple[datetime, str]] = {}
     park_runs, park_games, league_runs, league_games = defaultdict(float), defaultdict(float), 0.0, 0.0
     il_timelines = fetch_il_timelines()
+    statcast_timelines = fetch_statcast_daily_aggregates()
     output = []
     for game in games.sort_values(["date_dt", "gid"]).to_dict("records"):
         home, away, gid = game["hometeam"], game["visteam"], game["gid"]
@@ -202,6 +207,14 @@ def build_training_frame(season_dirs: Iterable[Path]):
         away_il_pitchers, away_il_batters = active_il_counts(il_timelines.get(away, []), game_date)
         row["il_pitchers_diff"] = float(home_il_pitchers - away_il_pitchers)
         row["il_batters_diff"] = float(home_il_batters - away_il_batters)
+
+        home_statcast_days, away_statcast_days = statcast_timelines.get(home, []), statcast_timelines.get(away, [])
+        for window in STATCAST_WINDOWS:
+            window_days = int(window[:-1])
+            home_rates = statcast_rates(home_statcast_days, game_date, window_days)
+            away_rates = statcast_rates(away_statcast_days, game_date, window_days)
+            for metric in STATCAST_METRICS:
+                row[f"{metric}_{window}_diff"] = home_rates[metric] - away_rates[metric]
         output.append(row)
 
         expected = 1 / (1 + 10 ** (-((elo[home] + 24) - elo[away]) / 400))
