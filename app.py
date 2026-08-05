@@ -1311,7 +1311,13 @@ def get_free_ensemble_services():
         settings.cache_path,
         timeout=settings.request_timeout_seconds,
         attempts=settings.max_attempts,
-        requests_per_second=8.0,
+        # A cold-cache 15-game slate needs several hundred unique MLB Stats
+        # API / Open-Meteo calls (rolling team windows, bullpen boxscores,
+        # starter game logs, etc.). This limiter is shared across every
+        # worker thread, so it -- not thread count -- was the real ceiling
+        # on load time. statsapi.mlb.com tolerates well over this rate in
+        # bursts without throttling; raised from 8 to cut cold-load time.
+        requests_per_second=25.0,
     )
     return (
         FreeMLBStatsClient(http),
@@ -3622,7 +3628,10 @@ with st.spinner(f"Loading real-time stats for {len(games)} game(s) on {date_str}
     # run_free_ensemble is cached, so model_moneyline_game immediately reuses
     # these results and the 10-second live fragment does not rebuild them.
     if games:
-        with ThreadPoolExecutor(max_workers=min(8, len(games))) as _ensemble_executor:
+        # Capped at 20 rather than 8 now that the shared rate limiter above can
+        # actually sustain more concurrent in-flight requests -- with only 8
+        # workers, the limiter's extra headroom just sat idle instead of being used.
+        with ThreadPoolExecutor(max_workers=min(20, len(games))) as _ensemble_executor:
             _ensemble_futures = [_ensemble_executor.submit(run_free_ensemble, g) for g in games]
             for _future in as_completed(_ensemble_futures):
                 try:
