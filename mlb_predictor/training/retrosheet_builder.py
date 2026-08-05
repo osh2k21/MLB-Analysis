@@ -9,6 +9,7 @@ from typing import Iterable
 import zipfile
 
 from ..features.catalog import FEATURE_NAMES, OFFENSE_METRICS, TEAM_PITCHING_METRICS, DEFENSE_METRICS, WINDOWS
+from .injuries import active_il_counts, fetch_il_timelines
 
 
 RAW_TEAM_COLUMNS = (
@@ -160,6 +161,7 @@ def build_training_frame(season_dirs: Iterable[Path]):
     elo = defaultdict(lambda: 1500.0)
     last_game: dict[str, tuple[datetime, str]] = {}
     park_runs, park_games, league_runs, league_games = defaultdict(float), defaultdict(float), 0.0, 0.0
+    il_timelines = fetch_il_timelines()
     output = []
     for game in games.sort_values(["date_dt", "gid"]).to_dict("records"):
         home, away, gid = game["hometeam"], game["visteam"], game["gid"]
@@ -194,6 +196,12 @@ def build_training_frame(season_dirs: Iterable[Path]):
         home_travel = float(bool(home_last and home_rest == 1 and home_last[1] != game["site"]))
         away_travel = float(bool(away_last and away_rest == 1 and away_last[1] != game["site"]))
         row["traveled_yesterday_diff"] = home_travel - away_travel
+
+        game_date = game["date_dt"].date()
+        home_il_pitchers, home_il_batters = active_il_counts(il_timelines.get(home, []), game_date)
+        away_il_pitchers, away_il_batters = active_il_counts(il_timelines.get(away, []), game_date)
+        row["il_pitchers_diff"] = float(home_il_pitchers - away_il_pitchers)
+        row["il_batters_diff"] = float(home_il_batters - away_il_batters)
         output.append(row)
 
         expected = 1 / (1 + 10 ** (-((elo[home] + 24) - elo[away]) / 400))

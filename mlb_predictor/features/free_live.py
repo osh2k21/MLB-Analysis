@@ -9,6 +9,7 @@ from ..contracts import DataStatus, Evidence, FeatureSnapshot, GameRef
 from .catalog import FEATURE_NAMES, OFFENSE_METRICS, TEAM_PITCHING_METRICS, DEFENSE_METRICS, WINDOWS
 from .engine import FeatureError
 from ..training.retrosheet_builder import RAW_PITCHER_COLUMNS, pitcher_rates, team_rates
+from ..training.injuries import active_il_counts, parse_il_events
 
 
 TEAM_CODES = {
@@ -111,6 +112,22 @@ class FreeLiveFeatureBuilder:
                 output.update({f"starter_{key}_{label}": value for key, value in aggregate(selected).items()})
         return output
 
+    def _il_counts(self, team_id: int, game_date: datetime) -> tuple[float, float]:
+        """Currently-active injured-list pitcher/batter counts, using the same parser and
+        counting logic as the training-side backfill in training/injuries.py (90-day lookback
+        is enough live since IL stints resolve within that window)."""
+        start = (game_date - timedelta(days=90)).date().isoformat()
+        end = game_date.date().isoformat()
+        result = self.mlb.http.get_json(
+            f"{self.mlb.base_url}/transactions", {"teamId": team_id, "startDate": start, "endDate": end},
+            ttl_seconds=1800, validator=lambda x: isinstance(x, dict) and isinstance(x.get("transactions"), list),
+        )
+        events = parse_il_events(result.data.get("transactions", []))
+        # active_il_counts excludes events on-or-after `as_of`; pass game_date's date plus one
+        # day so a same-day transaction (known before first pitch) still counts as active.
+        pitchers, batters = active_il_counts(events, game_date.date() + timedelta(days=1))
+        return float(pitchers), float(batters)
+
     def _rest_travel(self, team_id: int, game_date: datetime, venue_name: str) -> tuple[float, float]:
         start = (game_date - timedelta(days=7)).date().isoformat(); end = (game_date - timedelta(days=1)).date().isoformat()
         result = self.mlb.http.get_json(
@@ -207,6 +224,11 @@ class FreeLiveFeatureBuilder:
         values["rest_days_diff"] = home_rest - away_rest
         values["traveled_yesterday_diff"] = home_travel - away_travel
         provenance["rest_days_diff"] = provenance["traveled_yesterday_diff"] = "MLB Stats API schedule"
+        home_il_pitchers, home_il_batters = self._il_counts(game.home_team_id, game_dt)
+        away_il_pitchers, away_il_batters = self._il_counts(game.away_team_id, game_dt)
+        values["il_pitchers_diff"] = home_il_pitchers - away_il_pitchers
+        values["il_batters_diff"] = home_il_batters - away_il_batters
+        provenance["il_pitchers_diff"] = provenance["il_batters_diff"] = "MLB Stats API transactions"
         ratings = self.metadata.get("elo_ratings", {})
         values["team_elo_rating_diff"] = _num(ratings.get(TEAM_CODES.get(game.home_team)), 1500) - _num(ratings.get(TEAM_CODES.get(game.away_team)), 1500)
         provenance["team_elo_rating_diff"] = "Retrosheet historical Elo"

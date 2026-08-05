@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +13,7 @@ from mlb_predictor.features.weather import air_density_kg_m3
 from mlb_predictor.models.ensemble import EnsembleBundle
 from mlb_predictor.database import PredictionRepository
 from mlb_predictor.pipeline import PredictionPipeline
+from mlb_predictor.training.injuries import active_il_counts, parse_il_events
 from mlb_predictor.validation import GameValidator
 
 
@@ -93,6 +94,58 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(len(repository.settled()), 0)
             with repository.connection() as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0], 1)
+
+
+class InjuriesFeatureTests(unittest.TestCase):
+    def test_parses_pitcher_and_batter_placements(self):
+        snapshots = parse_il_events([
+            {"date": "2024-05-01", "person": {"id": 1}, "description": "New York Yankees placed LHP Carlos Rodón on the 15-day injured list."},
+            {"date": "2024-05-02", "person": {"id": 2}, "description": "New York Yankees placed RF Aaron Judge on the 10-day injured list."},
+            {"date": "2024-05-03", "person": {"id": 3}, "description": "New York Yankees placed 3B Ryan McMahon on the 10-day injured list."},
+        ])
+        self.assertEqual(snapshots, [
+            (date(2024, 5, 1), 1, 0),
+            (date(2024, 5, 2), 1, 1),
+            (date(2024, 5, 3), 1, 2),
+        ])
+
+    def test_activation_removes_the_player(self):
+        snapshots = parse_il_events([
+            {"date": "2024-05-01", "person": {"id": 1}, "description": "New York Yankees placed LHP Carlos Rodón on the 15-day injured list."},
+            {"date": "2024-05-10", "person": {"id": 1}, "description": "New York Yankees activated LHP Carlos Rodón from the 15-day injured list."},
+        ])
+        self.assertEqual(snapshots[-1], (date(2024, 5, 10), 0, 0))
+
+    def test_unrelated_transactions_are_ignored(self):
+        snapshots = parse_il_events([
+            {"date": "2024-05-01", "person": {"id": 1}, "description": "New York Yankees signed RHP Michael Harpster."},
+            {"date": "2024-05-02", "person": {"id": 2}, "description": "New York Yankees optioned 2B Oswald Peraza to Triple-A."},
+        ])
+        self.assertEqual(snapshots, [])
+
+    def test_duplicate_placement_for_the_same_stint_does_not_double_count(self):
+        # MLB's transaction log really does contain retroactive/corrected re-entries
+        # for the same injury stint -- a second "placed" for a player already
+        # tracked as active must be a no-op (no new snapshot), not another +1.
+        snapshots = parse_il_events([
+            {"date": "2024-05-01", "person": {"id": 1}, "description": "New York Yankees placed RF Aaron Judge on the 10-day injured list. Right rib stress fracture."},
+            {"date": "2024-05-03", "person": {"id": 1}, "description": "New York Yankees placed RF Aaron Judge on the 10-day injured list retroactive to May 1, 2024. Right rib stress fracture."},
+        ])
+        self.assertEqual(snapshots, [(date(2024, 5, 1), 0, 1)])
+
+    def test_placement_without_activation_counts_as_active(self):
+        snapshots = [(date(2024, 5, 1), 1, 0)]
+        self.assertEqual(active_il_counts(snapshots, date(2024, 5, 15)), (1, 0))
+
+    def test_activation_clears_the_placement(self):
+        snapshots = [(date(2024, 5, 1), 1, 0), (date(2024, 5, 10), 0, 0)]
+        self.assertEqual(active_il_counts(snapshots, date(2024, 5, 15)), (0, 0))
+
+    def test_snapshots_on_or_after_as_of_do_not_count(self):
+        snapshots = [(date(2024, 5, 10), 0, 1)]
+        self.assertEqual(active_il_counts(snapshots, date(2024, 5, 10)), (0, 0))
+        self.assertEqual(active_il_counts(snapshots, date(2024, 5, 9)), (0, 0))
+        self.assertEqual(active_il_counts(snapshots, date(2024, 5, 11)), (0, 1))
 
 
 if __name__ == "__main__":

@@ -35,7 +35,7 @@ BULLPEN = [
 CONTEXT = [
     "temperature_f", "wind_speed_mph", "roof_closed", "day_game",
     "park_run_factor", "rest_days_diff", "traveled_yesterday_diff",
-    "team_elo_rating_diff",
+    "team_elo_rating_diff", "il_pitchers_diff", "il_batters_diff",
 ]
 
 MARKET: list[str] = []  # post-model comparison, never a leaked training input
@@ -49,8 +49,8 @@ FEATURE_CATEGORIES = {
     "market": MARKET,
 }
 FEATURE_NAMES = [name for names in FEATURE_CATEGORIES.values() for name in names]
-FEATURE_VERSION = "2.0.0-free"
+FEATURE_VERSION = "2.1.0-free"
 
-assert len(FEATURE_NAMES) == 120, len(FEATURE_NAMES)
+assert len(FEATURE_NAMES) == 122, len(FEATURE_NAMES)
 assert len(FEATURE_NAMES) == len(set(FEATURE_NAMES))
 
