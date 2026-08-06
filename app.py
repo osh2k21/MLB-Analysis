@@ -1355,12 +1355,14 @@ def _prediction_stage(game):
 # -----------------------------------------------------------------------------
 # PREGAME PREDICTION LOCK
 # -----------------------------------------------------------------------------
-# Once a game is inside its final 15 minutes before first pitch, freeze
+# Once a game is inside its final 20 minutes before first pitch, freeze
 # whatever prediction is currently showing rather than letting it keep
-# recomputing off late-arriving data. This is deliberately a plain local
-# JSON file (not st.cache_data) so the lock survives cache expiry/app
-# restarts for the rest of that game's pregame window and Live state.
-_PREDICTION_LOCK_WINDOW = timedelta(minutes=15)
+# recomputing off late-arriving data -- lineups are almost always confirmed
+# by then, so there's little left to gain from waiting closer to first pitch.
+# This is deliberately a plain local JSON file (not st.cache_data) so the
+# lock survives cache expiry/app restarts for the rest of that game's
+# pregame window and Live state.
+_PREDICTION_LOCK_WINDOW = timedelta(minutes=20)
 _PREDICTION_LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "locked_predictions.json")
 _prediction_lock_mutex = threading.Lock()
 # Bump this whenever a bug in the LOCKING LOGIC ITSELF (not the model) could
@@ -1375,7 +1377,10 @@ _prediction_lock_mutex = threading.Lock()
 # were a real one. Fixed by only locking clean (non-degraded) results going
 # forward; this version bump clears out any bad lock already written before
 # that fix landed, since old entries have no lock_schema_version at all.
-_LOCK_SCHEMA_VERSION = 2
+# Bumped to 3: also clears every lock written under the old 15-minute window
+# now that it's 20, and any lock written during today's testing, so every
+# game recomputes fresh against the current window and current model.
+_LOCK_SCHEMA_VERSION = 3
 
 def _load_locked_predictions():
     try:
