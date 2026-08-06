@@ -2805,8 +2805,9 @@ def in_prediction_lock_window(r):
     live/final. Before this point, predictions are left to recalculate
     freely on every rerun (fresh injury news, lineup changes, updated
     pitcher/team stats, etc. can all still move the number, which is
-    useful this far out) -- only once the window is entered does
-    apply_locked_ml_prediction start freezing it."""
+    useful this far out). Only used to gate log_ml_prediction now (the
+    track-record log); the actual pick/probability freeze happens earlier
+    and separately, inside run_free_ensemble."""
     # Sportsbook-listed starters are useful early but can change late. Do not
     # freeze a provisional-pitcher forecast before MLB confirms it; this lets
     # the next 10-second schedule refresh rebuild the model on a replacement.
@@ -2901,59 +2902,6 @@ def apply_calibration_correction(r, calibration_lookup, min_edge, min_prob, min_
     if r.get('has_ml_market') and r.get('implied_prob') is not None:
         r['edge'] = (r['model_prob'] - r['implied_prob']) * 100.0
         r['is_qualified'] = r.get('recommendation_ready', r['is_ready']) and (r['edge'] >= min_edge) and (r['model_prob'] >= max(min_prob, 0.58))
-    return r
-
-def apply_locked_ml_prediction(conn, r, min_edge, min_prob):
-    """Freezes the model's moneyline pick/probability at whatever it was the
-    FIRST time this game was ever logged today (log_ml_prediction is a
-    no-op after that first insert, since it's INSERT OR IGNORE keyed on
-    game_pk). Without this, once a game goes live, the starting pitcher's
-    season ERA/WHIP/K9 -- which the MLB Stats API updates in real time as
-    HE pitches THIS very game -- keeps feeding back into 'the prediction'
-    for that same game, so the number drifts as a reaction to the game
-    already in progress rather than staying a stable pre-game forecast.
-    Market data (implied_prob/market_odds_str/edge) is intentionally left
-    live -- a real sportsbook/Kalshi price moving is useful information;
-    the model's own forecast drifting because of the outcome it's supposed
-    to be predicting is not."""
-    if not r.get('game_pk'):
-        return r
-    model_key = "ml_free_v2" if r.get('backend_model') else "ml_legacy"
-    pred_key = f"{r['game_pk']}:{model_key}"
-    try:
-        row = conn.execute(
-            "SELECT pick, model_prob FROM ml_predictions WHERE pred_key = ?", (pred_key,)
-        ).fetchone()
-    except sqlite3.OperationalError:
-        return r
-    if not row:
-        return r
-    locked_pick, locked_model_prob = row
-
-    r['pick'] = locked_pick
-    r['model_prob'] = locked_model_prob
-    r['underdog'] = r['home_team'] if locked_pick == r['away_team'] else r['away_team']
-    r['fair_odds'] = prob_to_american(locked_model_prob)
-    r['fair_multiplier'] = prob_to_multiplier(locked_model_prob)
-
-    # Re-derive market odds/implied prob for whichever side is now the
-    # LOCKED pick (not whatever side happened to be the freshly-computed
-    # pick this rerun) -- on the rare day the model's side actually flips
-    # intraday, this keeps the displayed market price matched to the real
-    # locked pick instead of silently showing the other team's odds.
-    market_entry = r.get('market_entry')
-    if r.get('has_ml_market') and market_entry and market_entry.get('h2h'):
-        h2h = market_entry['h2h']
-        market_odds = h2h['home_odds'] if locked_pick == r['home_team'] else h2h['away_odds']
-        implied_prob = american_to_prob(market_odds)
-        r['market_odds'] = market_odds
-        r['market_odds_str'] = fmt_american(market_odds)
-        r['implied_prob'] = implied_prob
-        r['edge'] = (locked_model_prob - implied_prob) * 100.0
-        r['is_qualified'] = r.get('recommendation_ready', r['is_ready']) and (r['edge'] >= min_edge) and (locked_model_prob >= max(min_prob, 0.58))
-    else:
-        r['edge'] = None
-        r['is_qualified'] = False
     return r
 
 def log_pitcher_start(conn, game_pk, game_date, pitcher_name, team, opponent, season_k_avg):
@@ -3723,8 +3671,17 @@ _calibration_lookup = get_calibration_lookup(_pred_conn)
 for r in ml_results:
     if r['is_ready'] and r.get('game_pk'):
         if in_prediction_lock_window(r):
+            # Logging only -- the actual pick/probability freeze now happens
+            # earlier, inside run_free_ensemble via _get_locked_prediction/
+            # _save_locked_prediction (20-min window, feature-version aware,
+            # only locks non-degraded results). apply_locked_ml_prediction
+            # used to ALSO freeze here, to whatever was first ever logged to
+            # mlb_track_record.db that day -- a second, older, 1-hour-window
+            # lock with no feature-version safety net that silently overrode
+            # the newer one and could freeze onto a stale/degraded early-day
+            # snapshot. Two independent locks racing to own the same field
+            # is the bug, not a feature; keep only the newer, safer one.
             _ = log_ml_prediction(_pred_conn, r)
-            apply_locked_ml_prediction(_pred_conn, r, min_edge_threshold, min_win_prob_threshold)
         apply_calibration_correction(r, _calibration_lookup, min_edge_threshold, min_win_prob_threshold)
 try:
     _pred_conn.commit()
@@ -3950,8 +3907,10 @@ def render_live_scores_section(current_date, current_market_map, min_edge, min_p
     for r in current_ml_results:
         if r['is_ready'] and r.get('game_pk'):
             if in_prediction_lock_window(r):
+                # See comment at the main-slate lock site above -- logging
+                # only, the freeze itself belongs solely to the newer
+                # feature-version-aware JSON lock inside run_free_ensemble.
                 _ = log_ml_prediction(_live_conn, r)
-                apply_locked_ml_prediction(_live_conn, r, min_edge, min_prob)
             apply_calibration_correction(r, _live_calibration_lookup, min_edge, min_prob)
     try:
         _live_conn.commit()
