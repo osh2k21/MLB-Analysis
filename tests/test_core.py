@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+import csv
 import math
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +17,7 @@ from mlb_predictor.models.ensemble import EnsembleBundle
 from mlb_predictor.database import PredictionRepository
 from mlb_predictor.pipeline import PredictionPipeline
 from mlb_predictor.training.injuries import active_il_counts, parse_il_events
+from mlb_predictor.training.recent_games import append_rows_to_csv, build_recent_training_rows, load_resolved_games
 from mlb_predictor.training.statcast import aggregate_day, statcast_rates
 from mlb_predictor.validation import GameValidator
 
@@ -204,6 +207,65 @@ class StatcastFeatureTests(unittest.TestCase):
         rates = statcast_rates([], date(2024, 5, 15), 7)
         self.assertTrue(math.isnan(rates["barrel_rate"]))
         self.assertTrue(math.isnan(rates["hard_hit_rate_allowed"]))
+
+
+class RecentGamesBackfillTests(unittest.TestCase):
+    def _track_db(self, tmp_dir):
+        path = Path(tmp_dir) / "track.db"
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE ml_predictions (pred_key TEXT, game_pk INTEGER, game_date TEXT, "
+            "away_team TEXT, home_team TEXT, resolved INTEGER, away_score REAL, home_score REAL)"
+        )
+        conn.executemany(
+            "INSERT INTO ml_predictions VALUES (?,?,?,?,?,?,?,?)",
+            [
+                ("a:1", 111, "2026-08-01", "Miami Marlins", "Atlanta Braves", 1, 2.0, 5.0),
+                # Same game_pk logged under two model keys -- DISTINCT must collapse this to one row.
+                ("a:2", 111, "2026-08-01", "Miami Marlins", "Atlanta Braves", 1, 2.0, 5.0),
+                ("b:1", 222, "2026-08-02", "Boston Red Sox", "New York Yankees", 1, None, None),  # not yet resolved with a score
+                ("c:1", 333, "2026-08-03", "Chicago Cubs", "St. Louis Cardinals", 0, 3.0, 1.0),  # unresolved
+            ],
+        )
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_load_resolved_games_requires_real_score_and_dedupes(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            games = load_resolved_games(self._track_db(tmp_dir))
+        self.assertEqual(len(games), 1)
+        self.assertEqual(games[0]["game_pk"], 111)
+        self.assertEqual(games[0]["home_score"], 5.0)
+
+    def test_checkpointed_game_is_skipped_without_any_client_call(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            checkpoint_path = Path(tmp_dir) / "checkpoint.json"
+            checkpoint_path.write_text('{"111": "done"}', encoding="utf-8")
+
+            class ExplodingClient:
+                def game_feed(self, game_pk):
+                    raise AssertionError("should not fetch a game already recorded in the checkpoint")
+
+            rows = build_recent_training_rows(
+                [{"game_pk": 111, "game_date": "2026-08-01", "away_team": "Miami Marlins",
+                  "home_team": "Atlanta Braves", "away_score": 2.0, "home_score": 5.0}],
+                ExplodingClient(), ExplodingClient(), {}, checkpoint_path=checkpoint_path,
+            )
+        self.assertEqual(rows, [])
+
+    def test_append_rows_to_csv_writes_header_once_then_appends(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_path = Path(tmp_dir) / "recent.csv"
+            row = {name: 0.0 for name in FEATURE_NAMES}
+            row.update({"game_date": "2026-08-01", "home_team": "Atlanta Braves", "away_team": "Miami Marlins",
+                        "site": "mlb_venue_4705", "home_runs": 5.0, "away_runs": 2.0, "home_win": 1})
+            append_rows_to_csv([row], out_path)
+            append_rows_to_csv([row], out_path)
+            with open(out_path, newline="", encoding="utf-8") as handle:
+                reader = list(csv.reader(handle))
+        self.assertEqual(reader[0][0], "game_date")
+        self.assertEqual(len(reader), 3)  # one header + two appended rows, header not repeated
 
 
 if __name__ == "__main__":

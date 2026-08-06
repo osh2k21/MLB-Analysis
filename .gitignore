@@ -8,5 +8,7 @@ data/*.sqlite3
 data/locked_predictions.json
 data/statcast_daily_cache.json
 data/free_training_games.csv
+data/recent_training_games.csv
+data/recent_games_checkpoint.json
 data/training/
 # The fitted production artifact and its audit report are intentionally versioned.

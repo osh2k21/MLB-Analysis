@@ -18,14 +18,20 @@ def _brier(probabilities, outcomes) -> float:
     return sum((float(p) - int(y)) ** 2 for p, y in zip(probabilities, outcomes)) / len(outcomes)
 
 
-def train_bundle(csv_path: Path, artifact_path: Path) -> tuple[EnsembleBundle, dict]:
+def train_bundle(csv_path: Path | list[Path], artifact_path: Path) -> tuple[EnsembleBundle, dict]:
     import joblib
     import pandas as pd
     from ..models.logistic import build_logistic_model
     from ..models.xgboost import build_xgboost_model
     from ..models.lightgbm import build_lightgbm_model
 
-    frame = pd.read_csv(csv_path)
+    # A list lets the Retrosheet historical set and the recent-games backfill
+    # (mlb_predictor.training.recent_games, sourced from the live track-record
+    # log instead of Retrosheet, which has no file for the current season)
+    # be trained together as one chronologically-sorted set, without a
+    # separate manual concat step before every retrain.
+    paths = csv_path if isinstance(csv_path, list) else [csv_path]
+    frame = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
     required = set(FEATURE_NAMES + ["game_date", "home_win"])
     missing = required - set(frame.columns)
     if missing:
@@ -119,7 +125,7 @@ def train_bundle(csv_path: Path, artifact_path: Path) -> tuple[EnsembleBundle, d
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train MLB ensemble with chronological holdouts")
-    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--input", type=Path, required=True, nargs="+", help="one or more training CSVs, concatenated before training")
     parser.add_argument("--output", type=Path, default=Path("artifacts/ensemble.joblib"))
     args = parser.parse_args()
     bundle, metrics = train_bundle(args.input, args.output)
