@@ -1355,11 +1355,12 @@ def _prediction_stage(game):
 # -----------------------------------------------------------------------------
 # PREGAME PREDICTION LOCK
 # -----------------------------------------------------------------------------
-# Once a game is inside its final hour before first pitch, freeze whatever
-# prediction is currently showing rather than letting it keep recomputing off
-# late-arriving data. This is deliberately a plain local JSON file (not
-# st.cache_data) so the lock survives cache expiry/app restarts for the rest
-# of that game's pregame window and Live state.
+# Once a game is inside its final 15 minutes before first pitch, freeze
+# whatever prediction is currently showing rather than letting it keep
+# recomputing off late-arriving data. This is deliberately a plain local
+# JSON file (not st.cache_data) so the lock survives cache expiry/app
+# restarts for the rest of that game's pregame window and Live state.
+_PREDICTION_LOCK_WINDOW = timedelta(minutes=15)
 _PREDICTION_LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "locked_predictions.json")
 _prediction_lock_mutex = threading.Lock()
 
@@ -1370,7 +1371,7 @@ def _load_locked_predictions():
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
-def _get_locked_prediction(game_pk):
+def _get_locked_prediction(game_pk, commence_time=None):
     if game_pk is None:
         return None
     entry = _load_locked_predictions().get(str(game_pk))
@@ -1384,6 +1385,18 @@ def _get_locked_prediction(game_pk):
     # model improvement for any game unlucky enough to have locked early.
     if entry.get("feature_version") != FEATURE_VERSION:
         return None
+    # A lock made under a wider window than the current _PREDICTION_LOCK_WINDOW
+    # (e.g. saved back when this was 1 hour, now tightened to 15 minutes) locked
+    # in too early by today's rule -- treat it as premature so it recomputes
+    # until it naturally re-locks at the right moment, instead of permanently
+    # freezing at whatever point the old, wider window happened to catch it.
+    if commence_time is not None:
+        try:
+            locked_at = datetime.fromisoformat(entry["locked_at"])
+        except (KeyError, ValueError):
+            return None
+        if commence_time - locked_at > _PREDICTION_LOCK_WINDOW:
+            return None
     return entry["result"]
 
 def _save_locked_prediction(game_pk, result):
@@ -1411,10 +1424,14 @@ def run_free_ensemble(game):
     model supports missing values, so the UI shows a labeled preliminary
     projection and upgrades it when starters and lineups arrive.
 
-    Once a game enters its final pregame hour, the prediction locks (see
-    _get_locked_prediction/_save_locked_prediction above) and stops changing.
+    Once a game enters its final _PREDICTION_LOCK_WINDOW before first pitch,
+    the prediction locks (see _get_locked_prediction/_save_locked_prediction
+    above) and stops changing.
     """
-    locked = _get_locked_prediction(game.get('game_pk'))
+    _commence = None
+    if game.get('game_datetime_utc'):
+        _commence = datetime.fromisoformat(game['game_datetime_utc'].replace('Z', '+00:00'))
+    locked = _get_locked_prediction(game.get('game_pk'), _commence)
     if locked is not None:
         return locked
 
@@ -1473,7 +1490,7 @@ def run_free_ensemble(game):
             for vote in prediction.votes
         ],
     }
-    if datetime.now(timezone.utc) >= ref.commence_time - timedelta(hours=1):
+    if datetime.now(timezone.utc) >= ref.commence_time - _PREDICTION_LOCK_WINDOW:
         _save_locked_prediction(game.get('game_pk'), result)
     return result
 
