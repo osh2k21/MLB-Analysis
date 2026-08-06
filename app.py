@@ -1512,6 +1512,11 @@ def run_free_ensemble(game):
             {'model': vote.model, 'home_probability': vote.home_probability, 'weight': vote.weight}
             for vote in prediction.votes
         ],
+        # Raw feature values actually fed to the model, keyed by name -- lets
+        # the deep-dive panel show exactly what the ensemble saw, so a local
+        # vs. deployed discrepancy can be diagnosed by diffing this dict
+        # directly instead of guessing which live data source disagrees.
+        'feature_values': dict(zip(bundle.feature_names, snapshot.ordered(bundle.feature_names))),
     }
     # Only lock a CLEAN result -- never one that fell back to all-NaN/median-
     # imputed features (feature_error set). A degraded prediction looks like a
@@ -2199,6 +2204,9 @@ def model_moneyline_game(game, market_map, min_edge, min_prob, strict_lineup_mod
         'prediction_stage': prediction_stage,
         'feature_coverage': ensemble_result['coverage'] if ensemble_result else 0.0,
         'model_votes': ensemble_result['votes'] if ensemble_result else [],
+        # .get(), not [] -- a lock saved before this field existed won't have
+        # it, and that must not crash the whole slate.
+        'model_feature_values': ensemble_result.get('feature_values', {}) if ensemble_result else {},
         'backend_error': ensemble_result.get('feature_error', '') if ensemble_result else ensemble_error,
         'lineups_confirmed': len(game.get('away_lineup') or []) >= 9 and len(game.get('home_lineup') or []) >= 9,
         'has_ml_market': has_ml_market,
@@ -4229,6 +4237,21 @@ st.info(
     f"⚖️ **Projected Run Differential:** {selected_game_item['projected_run_diff']:.2f} runs | "
     f"🛑 **Gate Status:** {gate_status_text}"
 )
+
+with st.expander("🔬 Model Diagnostic -- raw votes & feature values (for debugging a pick you don't expect)"):
+    _votes = selected_game_item.get('model_votes') or []
+    if _votes:
+        st.markdown("**Per-model votes (home win probability):**")
+        for _v in _votes:
+            st.write(f"- {_v['model']}: {_v['home_probability']*100:.1f}% (weight {_v['weight']:.3f})")
+    else:
+        st.write("No vote breakdown available for this game yet.")
+    _feats = selected_game_item.get('model_feature_values') or {}
+    if _feats:
+        st.markdown("**Raw feature values fed to the model (home minus away, unless noted):**")
+        st.json({k: (None if v != v else round(float(v), 4)) for k, v in sorted(_feats.items())})
+    else:
+        st.write("No feature snapshot available for this game yet.")
 
 st.markdown("#### 💡 Recommended Bets & Model Analysis for This Matchup")
 st.caption(
