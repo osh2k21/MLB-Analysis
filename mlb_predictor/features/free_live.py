@@ -42,6 +42,30 @@ def _innings_outs(value: Any) -> float:
     return int(whole or 0) * 3 + min(2, int(partial or 0))
 
 
+def prewarm_statcast_days(mlb: MLBStatsClient, as_of: datetime, days: int = 30, max_workers: int = 6) -> None:
+    """Warms the shared HttpClient cache for the last `days` days of Statcast pitch-level
+    data, ONCE, before any per-game FreeLiveFeatureBuilder.build() calls run.
+
+    Every game in a slate needs this same rolling window. If build() is called for many
+    games concurrently (a full slate is, via a ThreadPoolExecutor) without this prewarm
+    step, they all race to fetch the same ~30 days on a cold cache -- multiplying real
+    request volume by however many games get there before the cache is populated, instead
+    of one shared fetch. Call this once, synchronously, before starting per-game work."""
+    today = datetime.now(timezone.utc).date()
+
+    def _fetch(day) -> None:
+        ttl = 7 * 24 * 3600 if day < today else 3600
+        mlb.http.get_csv(
+            "https://baseballsavant.mlb.com/statcast_search/csv",
+            {"all": "true", "hfGT": "R|", "game_date_gt": day.isoformat(), "game_date_lt": day.isoformat(), "type": "details"},
+            ttl_seconds=ttl,
+        )
+
+    day_list = [(as_of - timedelta(days=offset)).date() for offset in range(1, days + 1)]
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        list(executor.map(_fetch, day_list))
+
+
 class FreeLiveFeatureBuilder:
     def __init__(self, mlb: MLBStatsClient, metadata: dict[str, Any] | None = None) -> None:
         self.mlb, self.metadata = mlb, metadata or {}
@@ -147,13 +171,18 @@ class FreeLiveFeatureBuilder:
         """Last 30 days of team-level barrel/hard-hit aggregates, day-fetched (not one big
         range query) so each day gets its own cache entry through the shared HttpClient:
         fully-completed past days are immutable and cached for a week, while today's
-        (possibly still in progress) date gets a short TTL. A full slate of games sharing
-        this same HttpClient means only the first game's build() actually re-fetches a
-        given day; the rest hit cache.
+        (possibly still in progress) date gets a short TTL.
 
         Fetched with a small thread pool -- each day is a multi-MB pitch-level CSV, and
         30 of them sequentially takes minutes; concurrent fetches (still throttled by the
-        shared HttpClient's own rate limiter) bring a cold cache down to tens of seconds."""
+        shared HttpClient's own rate limiter) bring a cold cache down to tens of seconds.
+
+        IMPORTANT: if multiple games' build() calls run concurrently (a full slate does,
+        via a ThreadPoolExecutor in app.py), they all need this same set of ~30 days and
+        will otherwise race each other on a cold cache -- every game re-fetching every day
+        before any of them finishes populating it, multiplying real request volume by
+        however many games get there first. Call prewarm_statcast_days() once, before
+        kicking off the per-game work, to fetch this shared data exactly once."""
         days = [(as_of - timedelta(days=offset)).date() for offset in range(1, 31)]
         daily: dict[str, list[tuple]] = {}
         with ThreadPoolExecutor(max_workers=6) as executor:

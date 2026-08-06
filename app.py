@@ -22,7 +22,8 @@ from mlb_predictor.api import MLBStatsClient as FreeMLBStatsClient
 from mlb_predictor.api import WeatherClient as FreeWeatherClient
 from mlb_predictor.config import load_settings as load_free_settings
 from mlb_predictor.contracts import GameRef as FreeGameRef, FeatureSnapshot as FreeFeatureSnapshot
-from mlb_predictor.features.free_live import FreeLiveFeatureBuilder, TEAM_CODES
+from mlb_predictor.features.catalog import FEATURE_VERSION
+from mlb_predictor.features.free_live import FreeLiveFeatureBuilder, TEAM_CODES, prewarm_statcast_days
 from mlb_predictor.pipeline import load_bundle as load_free_bundle
 
 # The parallel pre-warming used throughout this app (team/pitcher stats,
@@ -1373,7 +1374,17 @@ def _get_locked_prediction(game_pk):
     if game_pk is None:
         return None
     entry = _load_locked_predictions().get(str(game_pk))
-    return entry["result"] if entry else None
+    if not entry:
+        return None
+    # A lock made by an older model (different FEATURE_VERSION) is stale, not
+    # authoritative -- without this check, a game that locked in its final
+    # pregame hour BEFORE a model deploy would keep showing that old model's
+    # prediction forever after (locks persist across redeploys since the file
+    # isn't reset by a git-only redeploy), silently hiding every subsequent
+    # model improvement for any game unlucky enough to have locked early.
+    if entry.get("feature_version") != FEATURE_VERSION:
+        return None
+    return entry["result"]
 
 def _save_locked_prediction(game_pk, result):
     if game_pk is None:
@@ -1381,7 +1392,7 @@ def _save_locked_prediction(game_pk, result):
     with _prediction_lock_mutex:
         data = _load_locked_predictions()
         now = datetime.now(timezone.utc)
-        data[str(game_pk)] = {"result": result, "locked_at": now.isoformat()}
+        data[str(game_pk)] = {"result": result, "locked_at": now.isoformat(), "feature_version": FEATURE_VERSION}
         # Prune entries older than 3 days so this file doesn't grow forever over a season.
         data = {
             key: entry for key, entry in data.items()
@@ -3621,6 +3632,21 @@ with st.spinner(f"Loading real-time stats for {len(games)} game(s) on {date_str}
                 _futures.append(_executor.submit(_safe_call, get_pitcher_rest_days, pid, date_str, season))
             for _f in as_completed(_futures):
                 pass  # results are discarded -- this call's only job is to populate the shared cache
+
+    # Every game's Statcast feature needs the SAME rolling ~30 days of data.
+    # Fetch that shared window exactly once, synchronously, before the
+    # concurrent per-game loop below starts -- without this, every game
+    # races every other game to fetch the same days on a cold cache, each
+    # missing because none of them have finished populating it yet, which
+    # multiplies real Baseball Savant request volume by however many games
+    # get there first instead of one shared fetch. This was the actual
+    # cause of the post-Statcast slowdown, not the MLB Stats API calls.
+    if games:
+        try:
+            _mlb_for_prewarm, _, _ = get_free_ensemble_services()
+            prewarm_statcast_days(_mlb_for_prewarm, datetime.now(timezone.utc))
+        except Exception:
+            pass  # a prewarm failure just means the per-game calls fall back to fetching live below
 
     # Build the trained feature rows concurrently on a cold start. The HTTP
     # client still enforces one shared rate limit, while overlapping network
