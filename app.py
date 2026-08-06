@@ -1363,6 +1363,19 @@ def _prediction_stage(game):
 _PREDICTION_LOCK_WINDOW = timedelta(minutes=15)
 _PREDICTION_LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "locked_predictions.json")
 _prediction_lock_mutex = threading.Lock()
+# Bump this whenever a bug in the LOCKING LOGIC ITSELF (not the model) could
+# have written a bad lock, to force every existing entry to be treated as
+# invalid and recompute once. Separate from FEATURE_VERSION, which only
+# catches locks made by an older *model* -- it can't catch a lock that was
+# made by the current model on garbage input (see _LOCK_SCHEMA_VERSION = 2
+# below: a transient http_cache corruption made FreeLiveFeatureBuilder.build()
+# raise, which run_free_ensemble's OWN internal try/except quietly degraded
+# into an all-NaN, median-imputed prediction rather than propagating -- so it
+# never looked like a failure from the outside, and got locked in as if it
+# were a real one. Fixed by only locking clean (non-degraded) results going
+# forward; this version bump clears out any bad lock already written before
+# that fix landed, since old entries have no lock_schema_version at all.
+_LOCK_SCHEMA_VERSION = 2
 
 def _load_locked_predictions():
     try:
@@ -1376,6 +1389,8 @@ def _get_locked_prediction(game_pk, commence_time=None):
         return None
     entry = _load_locked_predictions().get(str(game_pk))
     if not entry:
+        return None
+    if entry.get("lock_schema_version") != _LOCK_SCHEMA_VERSION:
         return None
     # A lock made by an older model (different FEATURE_VERSION) is stale, not
     # authoritative -- without this check, a game that locked in its final
@@ -1405,7 +1420,10 @@ def _save_locked_prediction(game_pk, result):
     with _prediction_lock_mutex:
         data = _load_locked_predictions()
         now = datetime.now(timezone.utc)
-        data[str(game_pk)] = {"result": result, "locked_at": now.isoformat(), "feature_version": FEATURE_VERSION}
+        data[str(game_pk)] = {
+            "result": result, "locked_at": now.isoformat(),
+            "feature_version": FEATURE_VERSION, "lock_schema_version": _LOCK_SCHEMA_VERSION,
+        }
         # Prune entries older than 3 days so this file doesn't grow forever over a season.
         data = {
             key: entry for key, entry in data.items()
@@ -1490,7 +1508,13 @@ def run_free_ensemble(game):
             for vote in prediction.votes
         ],
     }
-    if datetime.now(timezone.utc) >= ref.commence_time - _PREDICTION_LOCK_WINDOW:
+    # Only lock a CLEAN result -- never one that fell back to all-NaN/median-
+    # imputed features (feature_error set). A degraded prediction looks like a
+    # normal successful return from here (it doesn't raise), so without this
+    # check a transient failure (e.g. a broken HTTP cache) could get frozen in
+    # permanently as if it were a real prediction, for the rest of that game's
+    # pregame window and beyond -- exactly what happened before this fix.
+    if not feature_error and datetime.now(timezone.utc) >= ref.commence_time - _PREDICTION_LOCK_WINDOW:
         _save_locked_prediction(game.get('game_pk'), result)
     return result
 
