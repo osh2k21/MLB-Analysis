@@ -31,32 +31,87 @@ class RateLimiter:
 
 
 class SQLiteCache:
+    """Concurrency note: with up to 20 games x dozens of calls each now running
+    at once (Statcast alone adds a 6-worker sub-pool per game), this file sees
+    far more simultaneous short-lived connections than it used to. SQLite's
+    default rollback-journal mode serializes writers and can misbehave under
+    that much concurrent contention; WAL mode (set once, persists in the file
+    itself) lets readers and a writer proceed without blocking each other and
+    is the standard fix for exactly this kind of workload."""
+
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
-        with self._connect() as conn:
+        self._ensure_schema()
+
+    def _create_schema(self) -> None:
+        conn = self._connect()
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS http_cache (cache_key TEXT PRIMARY KEY, body TEXT NOT NULL, "
                 "stored_at TEXT NOT NULL, expires_at REAL NOT NULL)"
             )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _ensure_schema(self) -> None:
+        try:
+            self._create_schema()
+        except sqlite3.Error:
+            # The file itself is corrupted (not just missing the table, which
+            # CREATE TABLE IF NOT EXISTS alone would have fixed) -- delete and
+            # start over. This is a disposable cache, never a source of truth,
+            # so losing it just means the next few requests are cache misses
+            # instead of every prediction on the page staying permanently broken.
+            # Connections above are always explicitly closed (not just left to
+            # `with`, which commits but does NOT close a sqlite3 connection) so
+            # this unlink never fights an open handle.
+            self.path.unlink(missing_ok=True)
+            self._create_schema()
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path, timeout=10)
 
     def get(self, key: str) -> Any | None:
-        with self._connect() as conn:
+        conn = self._connect()
+        try:
             row = conn.execute("SELECT body, expires_at FROM http_cache WHERE cache_key=?", (key,)).fetchone()
+        except sqlite3.Error:
+            # Self-heals a missing/corrupted cache file instead of permanently
+            # taking down every prediction that touches this cache.
+            conn.close()
+            self._ensure_schema()
+            return None
+        finally:
+            conn.close()
         if not row or row[1] < time.time():
             return None
         return json.loads(row[0])
 
     def put(self, key: str, value: Any, ttl_seconds: int) -> None:
         body = json.dumps(value, separators=(",", ":"), default=str)
-        with self._connect() as conn:
+        params = (key, body, datetime.now(timezone.utc).isoformat(), time.time() + ttl_seconds)
+        conn = self._connect()
+        try:
             conn.execute(
-                "INSERT OR REPLACE INTO http_cache(cache_key, body, stored_at, expires_at) VALUES(?,?,?,?)",
-                (key, body, datetime.now(timezone.utc).isoformat(), time.time() + ttl_seconds),
+                "INSERT OR REPLACE INTO http_cache(cache_key, body, stored_at, expires_at) VALUES(?,?,?,?)", params
             )
+            conn.commit()
+        except sqlite3.Error:
+            conn.close()
+            self._ensure_schema()
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO http_cache(cache_key, body, stored_at, expires_at) VALUES(?,?,?,?)", params
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            conn.close()
 
 
 @dataclass(frozen=True)
