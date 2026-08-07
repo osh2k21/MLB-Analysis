@@ -4098,7 +4098,11 @@ for idx, r in enumerate(non_final_results, 1):
         "Proj. Run Diff": f"{r['projected_run_diff']:.2f}",
     })
 
-st.dataframe(pd.DataFrame(ml_table_data_full), use_container_width=True, hide_index=True)
+_ml_table_full_df = pd.DataFrame(ml_table_data_full)
+# Same fix as the final-scores table above -- size height to the actual row
+# count so the whole slate renders at once instead of needing an inner scroll.
+_ml_table_full_height = (len(_ml_table_full_df) + 1) * 35 + 3
+st.dataframe(_ml_table_full_df, use_container_width=True, hide_index=True, height=_ml_table_full_height)
 st.caption(
     "🎯 **Prediction stage:** Early projections use the available team/Elo/bullpen data, then automatically "
     "upgrade when probable starters and confirmed lineups arrive. Preliminary means visible but not bet-ready "
