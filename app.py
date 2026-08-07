@@ -3855,11 +3855,17 @@ def render_scorechip_html(r, away_k=None, home_k=None, away_still_pitching=None,
         f'</div>'
     )
 
+    # A mid-game delay (rain, lightning, etc.) keeps abstractGameState at
+    # 'Live' -- detailedState is what actually says "Delayed" -- so without
+    # this check the badge kept reading LIVE while the table right below it
+    # correctly showed "(Delayed)", contradicting each other for the same game.
+    _live_status_text = 'DELAYED' if (r.get('detailed_state') or '').strip().startswith('Delayed') else 'LIVE'
+
     return (
         f'<div class="scorechip">'
         f'<div class="scorechip-title">{title_label}</div>'
         f'<div class="scorechip-status-row">'
-        f'<span class="scorechip-live-dot"></span><span class="scorechip-live-text">LIVE</span>'
+        f'<span class="scorechip-live-dot"></span><span class="scorechip-live-text">{_live_status_text}</span>'
         f'<span class="scorechip-inning-arrow">{inning_arrow}</span>'
         f'<span class="scorechip-inning-text">{inning_display}</span>'
         f'<span class="scorechip-info-icon" title="{r["time_ct"]}">ⓘ</span>'
